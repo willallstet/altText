@@ -189,6 +189,12 @@ class WebCrawler:
 
     def is_broken_image(self, url):
         print(f"Checking if {url} is broken...")
+        
+        # Skip checking obviously relative paths
+        if not url.startswith(('http://', 'https://')):
+            print(f"Skipping relative path: {url}")
+            return False
+        
         try:
             response = requests.get(url, timeout=5)
             return response.status_code != 200
@@ -241,41 +247,48 @@ class WebCrawler:
 
             for img in img_tags:
                 img_url = img.get('src')
-                alt_text = img.get('alt', '')
+                if not img_url:
+                    continue
+                
+                # Properly handle relative paths
+                img_url = urljoin(url, img_url)
+                if not img_url.startswith(('http://', 'https://')):
+                    print(f"Skipping invalid URL: {img_url}")
+                    continue
+                
+                if self.is_broken_image(img_url):
+                    print(f"Broken image found: {img_url}")
+                    alt_text = img.get('alt', '')
 
-                if img_url:
-                    img_url = urljoin(url, img_url)
-                    if self.is_broken_image(img_url):
-                        print(f"Broken image found: {img_url}")
-                        if alt_text:
-                            if alt_text == self.last_published_alt_text:
-                                print(f"Skipping duplicate alt text: {alt_text}")
-                                continue
-                            
-                            broken_images_alt_texts.append(alt_text)
-                            print(f"Alt text saved: {alt_text}")
-                            self.broken_images_count += 1
-                            
-                            self.recent_posts.append(url)
-                            if len(self.recent_posts) > self.max_recent_posts:
-                                self.recent_posts.pop(0)
-                            self.check_and_reorder_queue(url)
-                            
-                            current_time = datetime.now().strftime("%m/%d/%Y, %H:%M")
-                            img_filename = img_url.split('/')[-1]
-                            
-                            content = {
-                                'content': f'#*{alt_text}*\n\n{url}',
-                                'title': img_filename
-                            }
-                            try:
-                                self.arena_api.post_to_channel(self.channel_slug, content)
-                                print(f"Posted to Are.na channel: {self.channel_slug}")
-                                print(f"Total broken images found: {self.broken_images_count}")
-                                self.last_published_alt_text = alt_text
-                            except Exception as e:
-                                print(f"Failed to post to Are.na: {e}")
-                                self.broken_images_count -= 1
+                    if alt_text:
+                        if alt_text == self.last_published_alt_text:
+                            print(f"Skipping duplicate alt text: {alt_text}")
+                            continue
+                        
+                        broken_images_alt_texts.append(alt_text)
+                        print(f"Alt text saved: {alt_text}")
+                        self.broken_images_count += 1
+                        
+                        self.recent_posts.append(url)
+                        if len(self.recent_posts) > self.max_recent_posts:
+                            self.recent_posts.pop(0)
+                        self.check_and_reorder_queue(url)
+                        
+                        current_time = datetime.now().strftime("%m/%d/%Y, %H:%M")
+                        img_filename = img_url.split('/')[-1]
+                        
+                        content = {
+                            'content': f'#*{alt_text}*\n\n{url}',
+                            'title': img_filename
+                        }
+                        try:
+                            self.arena_api.post_to_channel(self.channel_slug, content)
+                            print(f"Posted to Are.na channel: {self.channel_slug}")
+                            print(f"Total broken images found: {self.broken_images_count}")
+                            self.last_published_alt_text = alt_text
+                        except Exception as e:
+                            print(f"Failed to post to Are.na: {e}")
+                            self.broken_images_count -= 1
 
             return broken_images_alt_texts
 
