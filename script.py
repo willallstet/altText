@@ -258,7 +258,7 @@ class WebCrawler:
                             img_filename = img_url.split('/')[-1]
                             
                             content = {
-                                'content': f'*{alt_text}*\n\n{url}',
+                                'content': f'#*{alt_text}*\n\n{url}',
                                 'title': img_filename
                             }
                             try:
