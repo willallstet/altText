@@ -204,7 +204,7 @@ class WebCrawler:
 
     def check_and_reorder_queue(self, base_url):
         domain_count = sum(1 for url in self.recent_posts if urlparse(url).netloc == urlparse(base_url).netloc)
-        
+        print(f"Domain count: {domain_count}")
         if domain_count == self.max_recent_posts:
             print(f"\nToo many recent posts from {urlparse(base_url).netloc}, reordering queue...")
             same_domain = []
