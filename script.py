@@ -203,16 +203,19 @@ class WebCrawler:
         return links
 
     def check_and_reorder_queue(self, base_url):
-        domain_count = sum(1 for url in self.recent_posts if urlparse(url).netloc == urlparse(base_url).netloc)
-        print(f"Domain count: {domain_count}")
+        base_domain = '/'.join(base_url.split('/')[:3])
+        print(f"\nRecent posts: {self.recent_posts}")
+        print(f"Current base domain: {base_domain}")
+        domain_count = sum(1 for url in self.recent_posts if '/'.join(url.split('/')[:3]) == base_domain)
+        
         if domain_count == self.max_recent_posts:
-            print(f"\nToo many recent posts from {urlparse(base_url).netloc}, reordering queue...")
+            print(f"\nToo many recent posts from {base_domain}, reordering queue...")
             same_domain = []
             different_domain = deque()
             
             while self.url_queue:
                 url = self.url_queue.popleft()
-                if urlparse(url).netloc == urlparse(base_url).netloc:
+                if '/'.join(url.split('/')[:3]) == base_domain:
                     same_domain.append(url)
                 else:
                     different_domain.append(url)
@@ -250,7 +253,6 @@ class WebCrawler:
                             self.recent_posts.append(url)
                             if len(self.recent_posts) > self.max_recent_posts:
                                 self.recent_posts.pop(0)
-                            
                             self.check_and_reorder_queue(url)
                             
                             current_time = datetime.now().strftime("%m/%d/%Y, %H:%M")
