@@ -116,13 +116,12 @@ class ArenaAPI:
         return response.json()
 
 class WebCrawler:
-    def __init__(self, start_url, arena_api, channel_slug, max_visited=1000):
+    def __init__(self, start_url, arena_api, channel_slug, max_visited=10000):
         self.start_url = start_url
         self.max_visited = max_visited
         self.arena_api = arena_api
         self.channel_slug = channel_slug
         
-        # Load saved state or initialize new state
         self.state_file = 'crawler_state.json'
         if os.path.exists(self.state_file):
             self.load_state()
@@ -130,19 +129,22 @@ class WebCrawler:
             self.url_queue = deque([start_url])
             self.visited_urls = set()
             self.known_domains = set()
+            self.broken_images_count = 0
         
-        # Register save state on exit
         atexit.register(self.save_state)
         signal.signal(signal.SIGINT, self.handle_exit)
         signal.signal(signal.SIGTERM, self.handle_exit)
 
+        self.recent_posts = []
+        self.max_recent_posts = 10
+
     def save_state(self):
-        """Save crawler state to file"""
         state = {
             'url_queue': list(self.url_queue),
             'visited_urls': list(self.visited_urls),
             'known_domains': list(self.known_domains),
-            'start_url': self.start_url
+            'start_url': self.start_url,
+            'broken_images_count': self.broken_images_count
         }
         
         with open(self.state_file, 'w') as f:
@@ -151,9 +153,9 @@ class WebCrawler:
         print(f"Queue size: {len(self.url_queue)}")
         print(f"Visited URLs: {len(self.visited_urls)}")
         print(f"Known domains: {len(self.known_domains)}")
+        print(f"Total broken images found: {self.broken_images_count}")
 
     def load_state(self):
-        """Load crawler state from file"""
         try:
             with open(self.state_file, 'r') as f:
                 state = json.load(f)
@@ -161,8 +163,8 @@ class WebCrawler:
             self.url_queue = deque(state['url_queue'])
             self.visited_urls = set(state['visited_urls'])
             self.known_domains = set(state['known_domains'])
+            self.broken_images_count = state.get('broken_images_count', 0)
             
-            # If start_url has changed, add it to the queue
             if state.get('start_url') != self.start_url:
                 self.url_queue.append(self.start_url)
             
@@ -170,15 +172,16 @@ class WebCrawler:
             print(f"Queue size: {len(self.url_queue)}")
             print(f"Visited URLs: {len(self.visited_urls)}")
             print(f"Known domains: {len(self.known_domains)}")
+            print(f"Total broken images found so far: {self.broken_images_count}")
             
         except (json.JSONDecodeError, KeyError) as e:
             print(f"Error loading state: {e}")
             self.url_queue = deque([self.start_url])
             self.visited_urls = set()
             self.known_domains = set()
+            self.broken_images_count = 0
 
     def handle_exit(self, signum, frame):
-        """Handle exit signals gracefully"""
         print("\nSaving state before exit...")
         self.save_state()
         exit(0)
@@ -198,6 +201,25 @@ class WebCrawler:
             if absolute_url.startswith(('http://', 'https://')):
                 links.append(absolute_url)
         return links
+
+    def check_and_reorder_queue(self, base_url):
+        domain_count = sum(1 for url in self.recent_posts if urlparse(url).netloc == urlparse(base_url).netloc)
+        
+        if domain_count == self.max_recent_posts:
+            print(f"\nToo many recent posts from {urlparse(base_url).netloc}, reordering queue...")
+            same_domain = []
+            different_domain = deque()
+            
+            while self.url_queue:
+                url = self.url_queue.popleft()
+                if urlparse(url).netloc == urlparse(base_url).netloc:
+                    same_domain.append(url)
+                else:
+                    different_domain.append(url)
+            
+            self.url_queue = different_domain
+            self.url_queue.extend(same_domain)
+            print(f"Moved {len(same_domain)} URLs to back of queue")
 
     def crawl_page_for_broken_images(self, url):
         try:
@@ -223,18 +245,29 @@ class WebCrawler:
                         if alt_text:
                             broken_images_alt_texts.append(alt_text)
                             print(f"Alt text saved: {alt_text}")
+                            self.broken_images_count += 1
                             
-                            # Format current time
+                            self.recent_posts.append(url)
+                            if len(self.recent_posts) > self.max_recent_posts:
+                                self.recent_posts.pop(0)
+                            
+                            self.check_and_reorder_queue(url)
+                            
                             current_time = datetime.now().strftime("%m/%d/%Y, %H:%M")
                             
+                            img_filename = img_url.split('/')[-1]
+                            
                             content = {
-                                'content': f'"{alt_text}"\n{url}\n{current_time}',
+                                'content': f'*{alt_text}*\n\n{url}',
+                                'title': img_filename
                             }
                             try:
                                 self.arena_api.post_to_channel(self.channel_slug, content)
                                 print(f"Posted to Are.na channel: {self.channel_slug}")
+                                print(f"Total broken images found: {self.broken_images_count}")
                             except Exception as e:
                                 print(f"Failed to post to Are.na: {e}")
+                                self.broken_images_count -= 1
 
             return broken_images_alt_texts
 
@@ -254,6 +287,7 @@ class WebCrawler:
 
     def continuous_crawl(self, interval=60):
         print("\nPress Ctrl+C to save and exit.")
+        print(f"Total broken images found so far: {self.broken_images_count}")
         try:
             while True:
                 current_url = self.get_next_url()
@@ -265,6 +299,7 @@ class WebCrawler:
 
                 print(f"Queue size: {len(self.url_queue)}")
                 print(f"Visited URLs: {len(self.visited_urls)}")
+                print(f"Total broken images: {self.broken_images_count}")
 
                 if broken_images:
                     print(f"Alt texts of broken images: {broken_images}")
@@ -293,10 +328,9 @@ if __name__ == "__main__":
     arena_api.get_authorization()
     print("Authorization successful!")
     
-    start_url = 'https://forums.somethingawful.com/' 
-    CHANNEL_SLUG = "https://www.are.na/will-allstetter/broken-images-and-the-alt-text-that-remains"
+    start_url = 'https://geocities.restorativland.org/Area51/Shadowlands/' 
+    CHANNEL_SLUG = "broken-images-and-the-alt-text-that-remains"
     
-    # Add state file to gitignore if it doesn't exist
     if not os.path.exists('.gitignore'):
         with open('.gitignore', 'w') as f:
             f.write('crawler_state.json\n')
