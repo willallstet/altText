@@ -138,6 +138,7 @@ class WebCrawler:
         self.last_published_alt_text = None
         self.recent_posts = []
         self.max_recent_posts = 10
+        self.potential_sources = ["https://www.tumblr.com/allaninnman/4606839433/re-blog-this-best-of-the-best-tumblr-artists"]
 
     def save_state(self):
         state = {
@@ -297,6 +298,26 @@ class WebCrawler:
             return []
 
     def get_next_url(self):
+        # 50% chance to inject and immediately return a random archived URL
+        if random.random() < 0.5:  # 50% chance
+            base_url = random.choice(self.potential_sources)
+            year = random.randint(1996, 2010)
+            month = random.randint(1, 12)
+            day = random.randint(1, 28)
+            
+            if 'web.archive.org' in base_url:
+                random_url = f"{base_url.replace('*', '')}{year}{month:02d}{day:02d}"
+                print(f"\nInjecting and crawling archived URL: {random_url}")
+            else:
+                # For non-archive.org URLs (like geocities), just append random numbers
+                random_path = str(random.randint(1000, 9999))
+                random_url = f"{base_url}{random_path}"
+                print(f"\nInjecting and crawling random URL: {random_url}")
+                
+            if random_url not in self.visited_urls:
+                return random_url
+        
+        # Continue with existing logic if we didn't return a random URL
         while self.url_queue:
             url = self.url_queue.popleft()
             if url not in self.visited_urls:
@@ -359,7 +380,7 @@ if __name__ == "__main__":
     arena_api.get_authorization()
     print("Authorization successful!")
     
-    start_url = 'https://www.sfgate.com/politics/article/what-is-poetry-2810665.php' 
+    start_url = 'https://www.tumblr.com/allaninnman/4606839433/re-blog-this-best-of-the-best-tumblr-artists' 
     CHANNEL_SLUG = "broken-images-and-the-alt-text-that-remains"
     
     if not os.path.exists('.gitignore'):
