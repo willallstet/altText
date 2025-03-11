@@ -135,6 +135,7 @@ class WebCrawler:
         signal.signal(signal.SIGINT, self.handle_exit)
         signal.signal(signal.SIGTERM, self.handle_exit)
 
+        self.last_published_alt_text = None
         self.recent_posts = []
         self.max_recent_posts = 10
 
@@ -247,6 +248,10 @@ class WebCrawler:
                     if self.is_broken_image(img_url):
                         print(f"Broken image found: {img_url}")
                         if alt_text:
+                            if alt_text == self.last_published_alt_text:
+                                print(f"Skipping duplicate alt text: {alt_text}")
+                                continue
+                            
                             broken_images_alt_texts.append(alt_text)
                             print(f"Alt text saved: {alt_text}")
                             self.broken_images_count += 1
@@ -257,7 +262,6 @@ class WebCrawler:
                             self.check_and_reorder_queue(url)
                             
                             current_time = datetime.now().strftime("%m/%d/%Y, %H:%M")
-                            
                             img_filename = img_url.split('/')[-1]
                             
                             content = {
@@ -268,6 +272,7 @@ class WebCrawler:
                                 self.arena_api.post_to_channel(self.channel_slug, content)
                                 print(f"Posted to Are.na channel: {self.channel_slug}")
                                 print(f"Total broken images found: {self.broken_images_count}")
+                                self.last_published_alt_text = alt_text
                             except Exception as e:
                                 print(f"Failed to post to Are.na: {e}")
                                 self.broken_images_count -= 1
