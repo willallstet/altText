@@ -4,14 +4,184 @@ import time
 from urllib.parse import urljoin
 from collections import deque
 import random
+import http.server
+import socketserver
+import webbrowser
+from urllib.parse import parse_qs, urlparse
+import threading
+import json
+import ssl
+import os
+from OpenSSL import crypto
+from dotenv import load_dotenv
+from datetime import datetime
+import signal
+import atexit
+
+load_dotenv()
+
+class OAuthCallbackHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        query_components = parse_qs(urlparse(self.path).query)
+        if 'code' in query_components:
+            self.server.oauth_code = query_components['code'][0]
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"Authorization successful! You can close this window.")
+            threading.Thread(target=self.server.shutdown).start()
+        else:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b"Authorization failed! Please try again.")
+
+def create_self_signed_cert():
+    key = crypto.PKey()
+    key.generate_key(crypto.TYPE_RSA, 2048)
+    
+    cert = crypto.X509()
+    cert.get_subject().CN = "localhost"
+    cert.set_serial_number(1000)
+    cert.gmtime_adj_notBefore(0)
+    cert.gmtime_adj_notAfter(365*24*60*60)
+    cert.set_issuer(cert.get_subject())
+    cert.set_pubkey(key)
+    cert.sign(key, 'sha256')
+    
+    cert_path = "localhost.crt"
+    key_path = "localhost.key"
+    
+    with open(cert_path, "wb") as f:
+        f.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
+    with open(key_path, "wb") as f:
+        f.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, key))
+    
+    return cert_path, key_path
+
+class ArenaAPI:
+    def __init__(self, client_id=None, client_secret=None, redirect_uri=None, access_token=None):
+        self.client_id = client_id or os.getenv('ARENA_CLIENT_ID')
+        self.client_secret = client_secret or os.getenv('ARENA_CLIENT_SECRET')
+        self.redirect_uri = redirect_uri or "https://localhost:8000/callback"
+        self.access_token = access_token or os.getenv('ARENA_ACCESS_TOKEN')
+        
+        if not self.access_token and not (self.client_id and self.client_secret):
+            raise ValueError("Either access_token or both client_id and client_secret must be provided")
+
+    def get_authorization(self):
+        if self.access_token:
+            print("Using existing access token")
+            return
+
+        if not (os.path.exists("localhost.crt") and os.path.exists("localhost.key")):
+            cert_path, key_path = create_self_signed_cert()
+        else:
+            cert_path, key_path = "localhost.crt", "localhost.key"
+
+        httpd = socketserver.TCPServer(('localhost', 8000), OAuthCallbackHandler)
+        httpd.socket = ssl.wrap_socket(
+            httpd.socket,
+            certfile=cert_path,
+            keyfile=key_path,
+            server_side=True
+        )
+        
+        auth_url = f"https://dev.are.na/oauth/authorize?client_id={self.client_id}&redirect_uri={self.redirect_uri}&response_type=code"
+        webbrowser.open(auth_url)
+        
+        httpd.serve_forever()
+        auth_code = httpd.oauth_code
+        
+        token_url = "https://dev.are.na/oauth/token"
+        data = {
+            'client_id': self.client_id,
+            'client_secret': self.client_secret,
+            'code': auth_code,
+            'redirect_uri': self.redirect_uri,
+            'grant_type': 'authorization_code'
+        }
+        response = requests.post(token_url, data=data)
+        self.access_token = response.json()['access_token']
+    
+    def post_to_channel(self, channel_slug, content):
+        if not self.access_token:
+            raise Exception("Not authenticated. Call get_authorization() first.")
+            
+        url = f"https://api.are.na/v2/channels/{channel_slug}/blocks"  
+        headers = {
+            'Authorization': f'Bearer {self.access_token}',
+            'Content-Type': 'application/json'
+        }
+        response = requests.post(url, headers=headers, json=content)
+        return response.json()
 
 class WebCrawler:
-    def __init__(self, start_url, max_visited=1000):
+    def __init__(self, start_url, arena_api, channel_slug, max_visited=1000):
         self.start_url = start_url
         self.max_visited = max_visited
-        self.url_queue = deque([start_url])
-        self.visited_urls = set()
-        self.known_domains = set()
+        self.arena_api = arena_api
+        self.channel_slug = channel_slug
+        
+        # Load saved state or initialize new state
+        self.state_file = 'crawler_state.json'
+        if os.path.exists(self.state_file):
+            self.load_state()
+        else:
+            self.url_queue = deque([start_url])
+            self.visited_urls = set()
+            self.known_domains = set()
+        
+        # Register save state on exit
+        atexit.register(self.save_state)
+        signal.signal(signal.SIGINT, self.handle_exit)
+        signal.signal(signal.SIGTERM, self.handle_exit)
+
+    def save_state(self):
+        """Save crawler state to file"""
+        state = {
+            'url_queue': list(self.url_queue),
+            'visited_urls': list(self.visited_urls),
+            'known_domains': list(self.known_domains),
+            'start_url': self.start_url
+        }
+        
+        with open(self.state_file, 'w') as f:
+            json.dump(state, f)
+        print(f"\nCrawler state saved to {self.state_file}")
+        print(f"Queue size: {len(self.url_queue)}")
+        print(f"Visited URLs: {len(self.visited_urls)}")
+        print(f"Known domains: {len(self.known_domains)}")
+
+    def load_state(self):
+        """Load crawler state from file"""
+        try:
+            with open(self.state_file, 'r') as f:
+                state = json.load(f)
+            
+            self.url_queue = deque(state['url_queue'])
+            self.visited_urls = set(state['visited_urls'])
+            self.known_domains = set(state['known_domains'])
+            
+            # If start_url has changed, add it to the queue
+            if state.get('start_url') != self.start_url:
+                self.url_queue.append(self.start_url)
+            
+            print(f"\nResuming previous crawl:")
+            print(f"Queue size: {len(self.url_queue)}")
+            print(f"Visited URLs: {len(self.visited_urls)}")
+            print(f"Known domains: {len(self.known_domains)}")
+            
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"Error loading state: {e}")
+            self.url_queue = deque([self.start_url])
+            self.visited_urls = set()
+            self.known_domains = set()
+
+    def handle_exit(self, signum, frame):
+        """Handle exit signals gracefully"""
+        print("\nSaving state before exit...")
+        self.save_state()
+        exit(0)
 
     def is_broken_image(self, url):
         try:
@@ -25,7 +195,6 @@ class WebCrawler:
         for a_tag in soup.find_all('a', href=True):
             href = a_tag['href']
             absolute_url = urljoin(base_url, href)
-            # Only add URLs that start with http/https
             if absolute_url.startswith(('http://', 'https://')):
                 links.append(absolute_url)
         return links
@@ -35,7 +204,6 @@ class WebCrawler:
             response = requests.get(url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
             soup = BeautifulSoup(response.text, 'html.parser')
 
-            # Extract new links and add them to the queue
             new_links = self.extract_links(soup, url)
             for link in new_links:
                 if link not in self.visited_urls:
@@ -55,6 +223,18 @@ class WebCrawler:
                         if alt_text:
                             broken_images_alt_texts.append(alt_text)
                             print(f"Alt text saved: {alt_text}")
+                            
+                            # Format current time
+                            current_time = datetime.now().strftime("%m/%d/%Y, %H:%M")
+                            
+                            content = {
+                                'content': f'"{alt_text}"\n{url}\n{current_time}',
+                            }
+                            try:
+                                self.arena_api.post_to_channel(self.channel_slug, content)
+                                print(f"Posted to Are.na channel: {self.channel_slug}")
+                            except Exception as e:
+                                print(f"Failed to post to Are.na: {e}")
 
             return broken_images_alt_texts
 
@@ -68,38 +248,61 @@ class WebCrawler:
             if url not in self.visited_urls:
                 return url
         
-        # If queue is empty, restart from a known domain or the start URL
         if self.known_domains:
             return random.choice(list(self.known_domains))
         return self.start_url
 
     def continuous_crawl(self, interval=60):
-        while True:
-            current_url = self.get_next_url()
-            print(f"\nCrawling page: {current_url}")
-            
-            broken_images = self.crawl_page_for_broken_images(current_url)
-            self.visited_urls.add(current_url)
-            self.known_domains.add(current_url)
+        print("\nPress Ctrl+C to save and exit.")
+        try:
+            while True:
+                current_url = self.get_next_url()
+                print(f"\nCrawling page: {current_url}")
+                
+                broken_images = self.crawl_page_for_broken_images(current_url)
+                self.visited_urls.add(current_url)
+                self.known_domains.add(current_url)
 
-            print(f"Queue size: {len(self.url_queue)}")
-            print(f"Visited URLs: {len(self.visited_urls)}")
+                print(f"Queue size: {len(self.url_queue)}")
+                print(f"Visited URLs: {len(self.visited_urls)}")
 
-            if broken_images:
-                print(f"Alt texts of broken images: {broken_images}")
-            else:
-                print("No broken images found.")
+                if broken_images:
+                    print(f"Alt texts of broken images: {broken_images}")
+                else:
+                    print("No broken images found.")
 
-            # Reset visited URLs if we've reached the maximum
-            if len(self.visited_urls) >= self.max_visited:
-                print("Resetting visited URLs list...")
-                self.visited_urls.clear()
+                if len(self.visited_urls) >= self.max_visited:
+                    print("Saving state before resetting visited URLs...")
+                    self.save_state()
+                    print("Resetting visited URLs list...")
+                    self.visited_urls.clear()
 
-            print(f"Waiting for {interval} seconds before the next crawl.")
-            time.sleep(interval)
+                print(f"Waiting for {interval} seconds before the next crawl.")
+                time.sleep(interval)
+                
+        except KeyboardInterrupt:
+            print("\nReceived keyboard interrupt...")
+            self.save_state()
+            print("Exiting gracefully.")
+            exit(0)
 
-# Starting point of the script
 if __name__ == "__main__":
-    start_url = 'https://example.com'  # Replace with your preferred starting point
-    crawler = WebCrawler(start_url)
+    arena_api = ArenaAPI()
+    
+    print("Checking authorization...")
+    arena_api.get_authorization()
+    print("Authorization successful!")
+    
+    start_url = 'https://forums.somethingawful.com/' 
+    CHANNEL_SLUG = "https://www.are.na/will-allstetter/broken-images-and-the-alt-text-that-remains"
+    
+    # Add state file to gitignore if it doesn't exist
+    if not os.path.exists('.gitignore'):
+        with open('.gitignore', 'w') as f:
+            f.write('crawler_state.json\n')
+    elif 'crawler_state.json' not in open('.gitignore').read():
+        with open('.gitignore', 'a') as f:
+            f.write('\ncrawler_state.json\n')
+    
+    crawler = WebCrawler(start_url, arena_api, CHANNEL_SLUG)
     crawler.continuous_crawl()
