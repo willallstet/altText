@@ -187,6 +187,7 @@ class WebCrawler:
         exit(0)
 
     def is_broken_image(self, url):
+        print(f"Checking if {url} is broken...")
         try:
             response = requests.get(url, timeout=5)
             return response.status_code != 200
@@ -290,6 +291,7 @@ class WebCrawler:
     def continuous_crawl(self, interval=60):
         print("\nPress Ctrl+C to save and exit.")
         print(f"Total broken images found so far: {self.broken_images_count}")
+        scrape_count = 0
         try:
             while True:
                 current_url = self.get_next_url()
@@ -298,6 +300,15 @@ class WebCrawler:
                 broken_images = self.crawl_page_for_broken_images(current_url)
                 self.visited_urls.add(current_url)
                 self.known_domains.add(current_url)
+                
+                scrape_count += 1
+                if scrape_count >= 10:
+                    print("\nShuffling queue...")
+                    queue_list = list(self.url_queue)
+                    random.shuffle(queue_list)
+                    self.url_queue = deque(queue_list)
+                    scrape_count = 0
+                    print(f"Queue shuffled. New first 5 URLs: {list(self.url_queue)[:5]}")
 
                 print(f"Queue size: {len(self.url_queue)}")
                 print(f"Visited URLs: {len(self.visited_urls)}")
@@ -330,7 +341,7 @@ if __name__ == "__main__":
     arena_api.get_authorization()
     print("Authorization successful!")
     
-    start_url = 'https://geocities.restorativland.org/Area51/Shadowlands/' 
+    start_url = 'https://www.sfgate.com/politics/article/what-is-poetry-2810665.php' 
     CHANNEL_SLUG = "broken-images-and-the-alt-text-that-remains"
     
     if not os.path.exists('.gitignore'):
