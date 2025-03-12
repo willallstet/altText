@@ -138,7 +138,23 @@ class WebCrawler:
         self.last_published_alt_text = None
         self.recent_posts = []
         self.max_recent_posts = 10
-        self.potential_sources = ["https://www.tumblr.com/allaninnman/4606839433/re-blog-this-best-of-the-best-tumblr-artists"]
+        self.potential_sources = [
+        # Old blog platforms
+        'https://geocities.restorativland.org/Area51/',
+        'https://web.archive.org/web/*/http://blogspot.com/*',
+        'https://web.archive.org/web/*/http://livejournal.com/*',
+        'https://web.archive.org/web/*/http://xanga.com/*',
+        # Art/Image hosting sites from 2000s
+        'https://web.archive.org/web/*/http://photobucket.com/*',
+        'https://web.archive.org/web/*/http://deviantart.com/*',
+        'https://web.archive.org/web/*/http://flickr.com/*',
+        # Old news sites
+        'https://web.archive.org/web/*/http://news.bbc.co.uk/*',
+        'https://web.archive.org/web/*/http://cnn.com/*',
+        # Old forums
+        'https://web.archive.org/web/*/http://forums.somethingawful.com/*',
+        'https://web.archive.org/web/*/http://forums.penny-arcade.com/*'
+        ]
 
     def save_state(self):
         state = {
