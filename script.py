@@ -254,10 +254,25 @@ class WebCrawler:
             response = requests.get(url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
             soup = BeautifulSoup(response.text, 'html.parser')
 
-            new_links = self.extract_links(soup, url)
-            for link in new_links:
+            # Extract links but only queue two random working ones
+            links = self.extract_links(soup, url)
+            random.shuffle(links)  # Randomize the links
+            working_links_added = 0
+            
+            for link in links:
+                if working_links_added >= 2:  # Stop after adding 2 links
+                    break
+                
                 if link not in self.visited_urls:
-                    self.url_queue.append(link)
+                    try:
+                        # Check if the link is working
+                        response = requests.get(link, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
+                        if response.status_code == 200:
+                            self.url_queue.append(link)
+                            working_links_added += 1
+                            print(f"Added working link to queue: {link}")
+                    except requests.RequestException:
+                        continue
 
             img_tags = soup.find_all('img')
             broken_images_alt_texts = []
@@ -267,7 +282,6 @@ class WebCrawler:
                 if not img_url:
                     continue
                 
-                # Properly handle relative paths
                 img_url = urljoin(url, img_url)
                 if not img_url.startswith(('http://', 'https://')):
                     print(f"Skipping invalid URL: {img_url}")
@@ -277,7 +291,8 @@ class WebCrawler:
                     print(f"Broken image found: {img_url}")
                     alt_text = img.get('alt', '')
 
-                    if alt_text:
+                    # Only process alt text if it has more than two words
+                    if alt_text and len(alt_text.split()) > 3:
                         if alt_text == self.last_published_alt_text:
                             print(f"Skipping duplicate alt text: {alt_text}")
                             continue
@@ -306,6 +321,8 @@ class WebCrawler:
                         except Exception as e:
                             print(f"Failed to post to Are.na: {e}")
                             self.broken_images_count -= 1
+                    else:
+                        print(f"Skipping alt text with 2 or fewer words: {alt_text}")
 
             return broken_images_alt_texts
 
@@ -315,7 +332,7 @@ class WebCrawler:
 
     def get_next_url(self):
         # 50% chance to inject and immediately return a random archived URL
-        if random.random() < 0.5:  # 50% chance
+        if random.random() < 0.0:  # 0% hance
             base_url = random.choice(self.potential_sources)
             year = random.randint(1996, 2010)
             month = random.randint(1, 12)
@@ -396,7 +413,7 @@ if __name__ == "__main__":
     arena_api.get_authorization()
     print("Authorization successful!")
     
-    start_url = 'https://www.tumblr.com/allaninnman/4606839433/re-blog-this-best-of-the-best-tumblr-artists' 
+    start_url = 'https://www.forumancientcoins.com/dougsmith/photo.html?srsltid=AfmBOooDh8XWrk5e34oyUy58lDdNCN18NxBprVDZXOlmSqZuAZXiV0TZ' 
     CHANNEL_SLUG = "broken-images-and-the-alt-text-that-remains"
     
     if not os.path.exists('.gitignore'):
