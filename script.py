@@ -156,6 +156,9 @@ class WebCrawler:
         'https://web.archive.org/web/*/http://forums.penny-arcade.com/*'
         ]
 
+        self.broken_images_file = 'broken_images.json'
+        self.broken_images_data = self.load_broken_images()
+
     def save_state(self):
         state = {
             'url_queue': list(self.url_queue),
@@ -249,28 +252,75 @@ class WebCrawler:
             self.url_queue.extend(same_domain)
             print(f"Moved {len(same_domain)} URLs to back of queue")
 
+    def load_broken_images(self):
+        try:
+            if os.path.exists(self.broken_images_file):
+                with open(self.broken_images_file, 'r') as f:
+                    return json.load(f)
+            return []
+        except json.JSONDecodeError:
+            return []
+
+    def save_broken_image(self, img_url, alt_text, page_url):
+        broken_image = {
+            'img_url': img_url,
+            'alt_text': alt_text,
+            'page_url': page_url,
+            'timestamp': datetime.now().strftime("%m/%d/%Y, %H:%M"),
+            'arena_post_success': False
+        }
+        self.broken_images_data.append(broken_image)
+        
+        try:
+            with open(self.broken_images_file, 'w') as f:
+                json.dump(self.broken_images_data, f, indent=2)
+            print(f"Saved broken image data to {self.broken_images_file}")
+        except Exception as e:
+            print(f"Failed to save broken image data: {e}")
+
     def crawl_page_for_broken_images(self, url):
         try:
             response = requests.get(url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
             soup = BeautifulSoup(response.text, 'html.parser')
 
-            # Extract links but only queue two random working ones
+            # Extract and sort links
             links = self.extract_links(soup, url)
-            random.shuffle(links)  # Randomize the links
-            working_links_added = 0
+            current_domain = '/'.join(url.split('/')[:3])
             
-            for link in links:
-                if working_links_added >= 2:  # Stop after adding 2 links
+            # Separate links by domain
+            external_links = [link for link in links if '/'.join(link.split('/')[:3]) != current_domain]
+            internal_links = [link for link in links if '/'.join(link.split('/')[:3]) == current_domain]
+            random.shuffle(external_links)
+            random.shuffle(internal_links)
+            
+            # Add up to 10 links, prioritizing external ones
+            links_added = 0
+            
+            # Try external links first
+            for link in external_links:
+                if links_added >= 6:
                     break
-                
-                if link not in self.visited_urls:
+                if link not in self.visited_urls and link not in self.url_queue:
                     try:
-                        # Check if the link is working
                         response = requests.get(link, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
                         if response.status_code == 200:
                             self.url_queue.append(link)
-                            working_links_added += 1
-                            print(f"Added working link to queue: {link}")
+                            links_added += 1
+                            print(f"Added external link to queue ({links_added}/10): {link}")
+                    except requests.RequestException:
+                        continue
+
+            # If we haven't added 10 links yet, try internal ones
+            for link in internal_links:
+                if links_added >= 10:
+                    break
+                if link not in self.visited_urls and link not in self.url_queue:
+                    try:
+                        response = requests.get(link, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
+                        if response.status_code == 200:
+                            self.url_queue.append(link)
+                            links_added += 1
+                            print(f"Added internal link to queue ({links_added}/10): {link}")
                     except requests.RequestException:
                         continue
 
@@ -291,8 +341,10 @@ class WebCrawler:
                     print(f"Broken image found: {img_url}")
                     alt_text = img.get('alt', '')
 
-                    # Only process alt text if it has more than two words
-                    if alt_text and len(alt_text.split()) > 3:
+                    if alt_text:
+                        # Save the broken image data regardless of Are.na posting success
+                        self.save_broken_image(img_url, alt_text, url)
+                        
                         if alt_text == self.last_published_alt_text:
                             print(f"Skipping duplicate alt text: {alt_text}")
                             continue
@@ -313,16 +365,30 @@ class WebCrawler:
                             'content': f'#*{alt_text}*\n\n{url}',
                             'title': img_filename
                         }
-                        try:
-                            self.arena_api.post_to_channel(self.channel_slug, content)
-                            print(f"Posted to Are.na channel: {self.channel_slug}")
-                            print(f"Total broken images found: {self.broken_images_count}")
-                            self.last_published_alt_text = alt_text
-                        except Exception as e:
-                            print(f"Failed to post to Are.na: {e}")
-                            self.broken_images_count -= 1
-                    else:
-                        print(f"Skipping alt text with 2 or fewer words: {alt_text}")
+
+                        # Add retry logic for Are.na posting
+                        max_retries = 3
+                        retry_delay = 5  # Start with 5 seconds
+                        for attempt in range(max_retries):
+                            try:
+                                self.arena_api.post_to_channel(self.channel_slug, content)
+                                print(f"Posted to Are.na channel: {self.channel_slug}")
+                                print(f"Total broken images found: {self.broken_images_count}")
+                                self.last_published_alt_text = alt_text
+                                # Update the last entry's arena_post_success status
+                                if self.broken_images_data:
+                                    self.broken_images_data[-1]['arena_post_success'] = True
+                                    with open(self.broken_images_file, 'w') as f:
+                                        json.dump(self.broken_images_data, f, indent=2)
+                                break
+                            except Exception as e:
+                                if attempt < max_retries - 1:  # Don't sleep on last attempt
+                                    print(f"Attempt {attempt + 1} failed, retrying in {retry_delay} seconds...")
+                                    time.sleep(retry_delay)
+                                    retry_delay *= 2  # Exponential backoff
+                                else:
+                                    print(f"Failed to post to Are.na after {max_retries} attempts: {e}")
+                                    self.broken_images_count -= 1
 
             return broken_images_alt_texts
 
@@ -390,7 +456,7 @@ class WebCrawler:
                     print(f"Alt texts of broken images: {broken_images}")
                 else:
                     print("No broken images found.")
-
+                
                 if len(self.visited_urls) >= self.max_visited:
                     print("Saving state before resetting visited URLs...")
                     self.save_state()
@@ -399,7 +465,7 @@ class WebCrawler:
 
                 print(f"Waiting for {interval} seconds before the next crawl.")
                 time.sleep(interval)
-                
+
         except KeyboardInterrupt:
             print("\nReceived keyboard interrupt...")
             self.save_state()
