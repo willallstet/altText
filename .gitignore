@@ -4,5 +4,4 @@
 __pycache__/
 *.pyc 
 crawler_state.json
-ssearch.txt
 broken_images.json
