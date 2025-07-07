@@ -5,3 +5,4 @@ __pycache__/
 *.pyc 
 crawler_state.json
 broken_images.json
+crawler_state copy.json
