@@ -7,7 +7,7 @@ import random
 import http.server
 import socketserver
 import webbrowser
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlunparse
 import threading
 import json
 import ssl
@@ -19,6 +19,13 @@ import signal
 import atexit
 from PIL import Image
 import io
+import sys
+
+# Platform-specific sound imports
+try:
+    import winsound  # Windows
+except ImportError:
+    winsound = None
 
 load_dotenv()
 
@@ -64,8 +71,19 @@ class ArenaAPI:
     def __init__(self, client_id=None, client_secret=None, redirect_uri=None, access_token=None):
         self.client_id = client_id or os.getenv('ARENA_CLIENT_ID')
         self.client_secret = client_secret or os.getenv('ARENA_CLIENT_SECRET')
-        self.redirect_uri = redirect_uri or "https://localhost:8000/callback"
+        
+        # Allow multiple redirect URI options - users can set ARENA_REDIRECT_URI env var to test different ones
+        if redirect_uri:
+            self.redirect_uri = redirect_uri
+        elif os.getenv('ARENA_REDIRECT_URI'):
+            self.redirect_uri = os.getenv('ARENA_REDIRECT_URI')
+        else:
+            self.redirect_uri = "https://localhost:8000/callback"
+            
         self.access_token = access_token or os.getenv('ARENA_ACCESS_TOKEN')
+        
+        # Create a session to maintain cookies and connection pooling
+        self.session = requests.Session()
         
         if not self.access_token and not (self.client_id and self.client_secret):
             raise ValueError("Either access_token or both client_id and client_secret must be provided")
@@ -73,25 +91,86 @@ class ArenaAPI:
     def get_authorization(self):
         if self.access_token:
             print("Using existing access token")
-            return
+            # Test the token to make sure it's valid
+            if self.test_access_token():
+                print("Access token is valid")
+                return
+            else:
+                print("Access token is invalid, getting new authorization...")
+                self.access_token = None
 
-        if not (os.path.exists("localhost.crt") and os.path.exists("localhost.key")):
-            cert_path, key_path = create_self_signed_cert()
-        else:
-            cert_path, key_path = "localhost.crt", "localhost.key"
+        print(f"\n{'='*60}")
+        print("ARE.NA OAUTH SETUP INSTRUCTIONS")
+        print(f"{'='*60}")
+        print(f"🔗 Your redirect URI should be set to: {self.redirect_uri}")
+        print(f"📝 Go to your Are.na app settings and configure this EXACTLY")
+        print(f"🌐 If this doesn't work, try these alternatives:")
+        print(f"   - http://localhost:8000/callback (HTTP instead of HTTPS)")
+        print(f"   - http://127.0.0.1:8000/callback (IP instead of localhost)")
+        print(f"   - https://127.0.0.1:8000/callback (HTTPS + IP)")
+        print(f"💡 To test different URIs, set: ARENA_REDIRECT_URI=http://localhost:8000/callback")
+        print(f"{'='*60}\n")
 
-        httpd = socketserver.TCPServer(('localhost', 8000), OAuthCallbackHandler)
-        httpd.socket = ssl.wrap_socket(
-            httpd.socket,
-            certfile=cert_path,
-            keyfile=key_path,
-            server_side=True
-        )
+        # Determine if we need SSL based on redirect URI
+        use_ssl = self.redirect_uri.startswith('https://')
+        
+        if use_ssl:
+            if not (os.path.exists("localhost.crt") and os.path.exists("localhost.key")):
+                print("🔑 Creating self-signed SSL certificate...")
+                cert_path, key_path = create_self_signed_cert()
+                print(f"✅ Certificate created: {cert_path}, {key_path}")
+            else:
+                cert_path, key_path = "localhost.crt", "localhost.key"
+                print(f"🔑 Using existing SSL certificate: {cert_path}, {key_path}")
+
+        try:
+            httpd = socketserver.TCPServer(('localhost', 8000), OAuthCallbackHandler)
+            
+            if use_ssl:
+                try:
+                    # Use modern SSL context instead of deprecated ssl.wrap_socket
+                    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                    context.load_cert_chain(cert_path, key_path)
+                    httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+                    print(f"🔒 Starting HTTPS server on port 8000...")
+                except Exception as ssl_error:
+                    print(f"❌ SSL setup failed: {ssl_error}")
+                    print("💡 Falling back to HTTP server...")
+                    # Update redirect URI to HTTP and recreate server
+                    self.redirect_uri = self.redirect_uri.replace('https://', 'http://')
+                    httpd = socketserver.TCPServer(('localhost', 8000), OAuthCallbackHandler)
+                    use_ssl = False
+            
+            if not use_ssl:
+                print(f"🌐 Starting HTTP server on port 8000...")
+            
+            print(f"✅ Server started successfully on {self.redirect_uri}")
+            
+        except Exception as e:
+            print(f"❌ Failed to start server: {e}")
+            print("💡 Possible solutions:")
+            print("   - Port 8000 might be in use - try closing other applications")
+            print("   - Try running as administrator")
+            print("   - Check if antivirus/firewall is blocking the connection")
+            raise Exception(f"Could not start callback server: {e}")
         
         auth_url = f"https://dev.are.na/oauth/authorize?client_id={self.client_id}&redirect_uri={self.redirect_uri}&response_type=code"
+        print(f"🚀 Opening browser for authorization...")
+        print(f"🔗 Auth URL: {auth_url}")
+        print(f"🔗 Redirect URI: {self.redirect_uri}")
         webbrowser.open(auth_url)
         
-        httpd.serve_forever()
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\n❌ Authorization cancelled by user")
+            httpd.shutdown()
+            return
+        except Exception as e:
+            print(f"❌ Server error: {e}")
+            httpd.shutdown()
+            raise
+            
         auth_code = httpd.oauth_code
         
         token_url = "https://dev.are.na/oauth/token"
@@ -102,8 +181,133 @@ class ArenaAPI:
             'redirect_uri': self.redirect_uri,
             'grant_type': 'authorization_code'
         }
-        response = requests.post(token_url, data=data)
-        self.access_token = response.json()['access_token']
+        
+        print(f"🔄 Exchanging authorization code for access token...")
+        print(f"📡 Token URL: {token_url}")
+        print(f"📝 Request data: {data}")
+        
+        # Add browser-like headers to bypass Cloudflare blocking
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Origin': 'https://dev.are.na',
+            'Referer': 'https://dev.are.na/',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache'
+        }
+        
+        try:
+            response = self.session.post(token_url, data=data, headers=headers)
+            print(f"📊 Response status: {response.status_code}")
+            print(f"📄 Response headers: {dict(response.headers)}")
+            
+            if response.status_code == 200:
+                try:
+                    token_data = response.json()
+                    print(f"✅ Token response: {token_data}")
+                    
+                    if 'access_token' in token_data:
+                        self.access_token = token_data['access_token']
+                        print(f"🎉 Access token obtained successfully!")
+                    else:
+                        print(f"❌ No access_token in response: {token_data}")
+                        raise Exception("No access_token in response")
+                        
+                except ValueError as e:
+                    print(f"❌ Invalid JSON response: {e}")
+                    print(f"🔍 Raw response: {response.text}")
+                    raise Exception(f"Invalid JSON response from Are.na token endpoint: {e}")
+            else:
+                print(f"❌ Token exchange failed with status {response.status_code}")
+                print(f"🔍 Error response: {response.text}")
+                raise Exception(f"Token exchange failed: {response.status_code} - {response.text}")
+                
+        except requests.RequestException as e:
+            print(f"❌ Request failed: {e}")
+            raise Exception(f"Failed to exchange authorization code: {e}")
+    
+    def test_access_token(self):
+        """Test if the current access token is valid by making a simple API call"""
+        if not self.access_token:
+            return False
+        
+        try:
+            # Test the token with a simple API call (get user info)
+            url = "https://api.are.na/v2/me"
+            headers = {
+                'Authorization': f'Bearer {self.access_token}',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Connection': 'keep-alive',
+                'Referer': 'https://are.na/',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'same-origin'
+            }
+            response = self.session.get(url, headers=headers, timeout=10)
+            return response.status_code == 200
+        except Exception as e:
+            print(f"Error testing access token: {e}")
+            return False
+    
+    def test_channel_access(self, channel_slug):
+        """Test if the channel exists and is accessible"""
+        if not self.access_token:
+            return False
+            
+        try:
+            url = f"https://api.are.na/v2/channels/{channel_slug}"
+            headers = {
+                'Authorization': f'Bearer {self.access_token}',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Connection': 'keep-alive',
+                'Referer': 'https://are.na/',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'same-origin'
+            }
+            
+            print(f"🔍 Testing channel access: {url}")
+            print(f"🔑 Using access token: {self.access_token[:10]}...")
+            
+            response = self.session.get(url, headers=headers, timeout=10)
+            
+            print(f"📊 Response status: {response.status_code}")
+            print(f"📄 Response encoding: {response.encoding}")
+            print(f"🔍 Response content preview: {response.text[:200]}...")
+            
+            if response.status_code == 200:
+                try:
+                    channel_data = response.json()
+                    print(f"✅ Channel found: '{channel_data.get('title', 'Unknown')}' (ID: {channel_data.get('id', 'Unknown')})")
+                    print(f"📊 Channel status: {channel_data.get('status', 'Unknown')}")
+                    print(f"👥 Channel collaboration: {channel_data.get('collaboration', 'Unknown')}")
+                    return True
+                except ValueError as e:
+                    print(f"❌ JSON parsing failed: {e}")
+                    print(f"🔍 Raw response: {response.text}")
+                    return False
+            else:
+                print(f"❌ Channel access failed: Status {response.status_code}")
+                print(f"🔍 Error response: {response.text}")
+                if response.status_code == 404:
+                    print("Channel not found. Please check the channel slug.")
+                elif response.status_code == 403:
+                    print("Access denied. You might not have permission to access this channel.")
+                return False
+        except Exception as e:
+            print(f"❌ Error testing channel access: {e}")
+            return False
     
     def post_to_channel(self, channel_slug, content):
         if not self.access_token:
@@ -112,17 +316,66 @@ class ArenaAPI:
         url = f"https://api.are.na/v2/channels/{channel_slug}/blocks"  
         headers = {
             'Authorization': f'Bearer {self.access_token}',
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Connection': 'keep-alive',
+            'Origin': 'https://are.na',
+            'Referer': 'https://are.na/',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache'
         }
-        response = requests.post(url, headers=headers, json=content)
-        return response.json()
+        
+        print(f"📡 Posting to Are.na: {url}")
+        print(f"📝 Content: {content}")
+        
+        response = self.session.post(url, headers=headers, json=content)
+        
+        print(f"📊 Response status: {response.status_code}")
+        print(f"📄 Response encoding: {response.encoding}")
+        print(f"🔍 Response content preview: {response.text[:200]}...")
+        
+        # Check if the request was successful
+        if response.status_code == 200 or response.status_code == 201:
+            try:
+                result = response.json()
+                print(f"✅ Block created successfully: {result.get('id', 'Unknown ID')}")
+                return result
+            except ValueError as e:
+                print(f"❌ Invalid JSON response: {e}")
+                print(f"🔍 Raw response: {response.text}")
+                raise Exception(f"Invalid JSON response from Are.na: {e}")
+        else:
+            # Handle different error status codes
+            print(f"❌ API request failed with status {response.status_code}")
+            print(f"🔍 Error response: {response.text}")
+            
+            error_msg = f"Are.na API error (status {response.status_code})"
+            try:
+                error_data = response.json()
+                if 'error' in error_data:
+                    error_msg += f": {error_data['error']}"
+                elif 'message' in error_data:
+                    error_msg += f": {error_data['message']}"
+                else:
+                    error_msg += f": {error_data}"
+            except ValueError:
+                # Response isn't JSON, use the raw text
+                error_msg += f": {response.text[:200]}"
+            
+            raise Exception(error_msg)
 
 class WebCrawler:
-    def __init__(self, start_url, arena_api, channel_slug, max_visited=10000):
+    def __init__(self, start_url, arena_api, channel_slug, max_visited=10000, sound_notifications=True):
         self.start_url = start_url
         self.max_visited = max_visited
         self.arena_api = arena_api
         self.channel_slug = channel_slug
+        self.sound_notifications = sound_notifications
         
         self.state_file = 'crawler_state.json'
         if os.path.exists(self.state_file):
@@ -186,43 +439,102 @@ class WebCrawler:
 
     def is_broken_image(self, url):
         try:
-            # For relative paths, try both the base URL and the full directory path
+            # Resolve relative URLs against current page
             if not url.startswith(('http://', 'https://')):
-                # Get the directory of the current page by removing everything after the last slash
-                base_dir = '/'.join(self.current_url.split('/')[:-1]) + '/'
-                
-                # Try the full directory path first
-                img_url = urljoin(base_dir, url)
-                
-                try:
-                    response = requests.get(img_url, timeout=10, headers={
-                        'User-Agent': 'Mozilla/5.0',
-                        'Accept': 'image/*',
-                        'Referer': self.current_url
-                    })
-                    if self._validate_image_response(response, img_url):
-                        return False
-                except requests.RequestException:
-                    pass
-                
-                # If that fails, try the base URL
-                img_url = urljoin(self.current_url, url)
+                base_dir = self._get_base_directory_url(self.current_url)
+                primary_url = urljoin(base_dir, url)
+                fallback_url = urljoin(self.current_url, url)
             else:
-                img_url = url
-            
-            response = requests.get(img_url, timeout=10, headers={
-                'User-Agent': 'Mozilla/5.0',
-                'Accept': 'image/*',
-                'Referer': self.current_url
-            })
-            
-            if self._validate_image_response(response, img_url):
+                primary_url = url
+                fallback_url = url
+
+            # First probe: with Referer
+            if self._probe_image_valid(primary_url, referer=self.current_url):
                 return False
-            else:
-                return True
-        
+
+            # If relative and first probe failed, try fallback resolved URL
+            if fallback_url != primary_url and self._probe_image_valid(fallback_url, referer=self.current_url):
+                return False
+
+            # Second probe: without Referer (some CDNs block hotlinking)
+            if self._probe_image_valid(primary_url, referer=None, user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Safari/605.1.15'):
+                return False
+
+            return True
+
         except requests.RequestException:
             return True
+
+    def _probe_image_valid(self, img_url, referer=None, user_agent=None):
+        """Lightweight probe to determine if an image URL is valid without downloading the whole body."""
+        headers = {
+            'User-Agent': user_agent or 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'image/*',
+            'Accept-Encoding': 'identity',  # avoid compressed HTML error pages
+        }
+        if referer:
+            headers['Referer'] = referer
+
+        try:
+            with requests.get(img_url, headers=headers, timeout=10, stream=True, allow_redirects=True) as resp:
+                # HTTP status must be OK
+                if resp.status_code < 200 or resp.status_code >= 300:
+                    return False
+
+                content_type = (resp.headers.get('Content-Type') or '').lower()
+                content_length = resp.headers.get('Content-Length')
+
+                # Read a small chunk to sniff content (do not download full file)
+                chunk = b''
+                for data in resp.iter_content(chunk_size=4096):
+                    chunk = data or b''
+                    break
+
+                # Empty body → likely invalid
+                if not chunk:
+                    return False
+
+                # If we inadvertently received HTML/JSON, it's not an image
+                head_lower = chunk[:256].lower()
+                if b'<html' in head_lower or b'<!doctype' in head_lower or head_lower.strip().startswith((b'{', b'[')):
+                    return False
+
+                # If server claims an image type and gave us bytes, consider valid
+                if content_type.startswith('image/'):
+                    return True
+
+                # Otherwise, try magic-byte sniffing for common image formats
+                if self._detect_image_format_by_signature(chunk):
+                    return True
+
+                # As a final heuristic: if content-length header exists and is sensible (> 50 bytes), accept
+                try:
+                    if content_length is not None and int(content_length) > 50:
+                        return True
+                except Exception:
+                    pass
+
+                return False
+        except requests.RequestException:
+            return False
+
+    def _get_base_directory_url(self, page_url):
+        """Return the proper base directory URL for resolving relative resources."""
+        p = urlparse(page_url)
+        path = p.path or '/'
+        if path.endswith('/'):
+            dir_path = path
+        else:
+            last_segment = path.rsplit('/', 1)[-1]
+            if '.' in last_segment:
+                # Looks like a file: drop filename
+                dir_path = path.rsplit('/', 1)[0] + '/'
+                if dir_path == '//':
+                    dir_path = '/'
+            else:
+                # Looks like a directory without trailing '/'
+                dir_path = path + '/'
+        return urlunparse((p.scheme, p.netloc, dir_path, '', '', ''))
 
     def _validate_image_response(self, response, img_url):
         """
@@ -230,8 +542,9 @@ class WebCrawler:
         1. HTTP status code
         2. Content-Type header
         3. Content-Length (file size)
-        4. PIL image verification
-        5. Image format detection
+        4. PIL image verification (for raster images)
+        5. SVG validation (for vector graphics)
+        6. Image format detection
         """
         try:
             # Check HTTP status
@@ -246,8 +559,10 @@ class WebCrawler:
                     return False
                 if 'application/json' in content_type:
                     return False
-                # Allow some generic types but be cautious
-                if not content_type.startswith(('application/octet-stream', 'binary/')):
+                # Allow SVG files which might be served as text/xml or application/xml
+                if 'xml' in content_type and img_url.lower().endswith('.svg'):
+                    pass  # Continue with SVG validation
+                elif not content_type.startswith(('application/octet-stream', 'binary/')):
                     return False
             
             # Check Content-Length (file size)
@@ -277,7 +592,11 @@ class WebCrawler:
             if image_data.strip().startswith(b'{') or image_data.strip().startswith(b'['):
                 return False
             
-            # Use PIL to verify image integrity and detect format
+            # Special handling for SVG files
+            if img_url.lower().endswith('.svg') or 'image/svg' in content_type:
+                return self._validate_svg_content(image_data)
+            
+            # Use PIL to verify raster image integrity and detect format
             try:
                 with Image.open(io.BytesIO(image_data)) as img:
                     img_format = img.format
@@ -296,6 +615,30 @@ class WebCrawler:
                 
                 return False
                 
+        except Exception:
+            return False
+
+    def _validate_svg_content(self, svg_data):
+        """
+        Validate SVG content by checking for SVG-specific elements
+        """
+        try:
+            # Convert to string for text-based validation
+            svg_text = svg_data.decode('utf-8', errors='ignore').lower()
+            
+            # Check for SVG signature and basic structure
+            if '<svg' in svg_text and ('xmlns' in svg_text or 'viewbox' in svg_text):
+                # Make sure it's not an error page disguised as SVG
+                if 'error' in svg_text or 'not found' in svg_text or '404' in svg_text:
+                    return False
+                return True
+            
+            # Also check for XML declaration with SVG
+            if '<?xml' in svg_text and '<svg' in svg_text:
+                return True
+                
+            return False
+            
         except Exception:
             return False
 
@@ -326,6 +669,13 @@ class WebCrawler:
         # Special check for WebP (needs more bytes to verify)
         if len(image_data) >= 12 and image_data.startswith(b'RIFF') and image_data[8:12] == b'WEBP':
             return True
+        
+        # Special check for SVG files (XML-based)
+        if len(image_data) >= 5:
+            # Check for XML declaration or direct SVG tag
+            text_start = image_data[:100].decode('utf-8', errors='ignore').lower()
+            if '<?xml' in text_start or '<svg' in text_start:
+                return True
         
         return False
 
@@ -428,6 +778,18 @@ class WebCrawler:
                 if not img_url.startswith(('http://', 'https://')):
                     continue
                 
+                # Skip certain file types entirely
+                if img_url.lower().endswith(('.svg', '.avif')):
+                    continue
+                
+                # Skip tiny tracking pixels and spacer images
+                img_filename = img_url.split('/')[-1].lower()
+                skip_patterns = ['1px.gif', 'blank.gif', 'spacer.gif', 'pixel.gif', 'clear.gif', 
+                               'transparent.gif', 'empty.gif', 'invisible.gif', '1x1.gif', 
+                               'dot.gif', 'space.gif', 'tracker.gif', '0x0.gif']
+                if any(pattern in img_filename for pattern in skip_patterns):
+                    continue
+                
                 if self.is_broken_image(img_url):
                     alt_text = img.get('alt', '')
 
@@ -444,7 +806,12 @@ class WebCrawler:
                             continue
                         
                         broken_images_alt_texts.append(alt_text)
-                        print(f"Broken image found: {alt_text}")
+                        
+                        # Play notification sound for broken image
+                        self.play_notification_sound()
+                        
+                        print(f"🚨 BROKEN IMAGE FOUND: {alt_text} 🚨")
+                        
                         self.broken_images_count += 1
                         
                         self.recent_posts.append(url)
@@ -455,8 +822,9 @@ class WebCrawler:
                         img_filename = img_url.split('/')[-1]
                         
                         content = {
-                            'content': f'#*{alt_text}*\n\n{url}',
-                            'title': img_filename
+                            'content': f'{alt_text}',
+                            'title': alt_text,
+                            'description': f'page url: *{url}*\nimage url: *{img_url}*',
                         }
 
                         # Add retry logic for Are.na posting
@@ -464,6 +832,14 @@ class WebCrawler:
                         retry_delay = 5  # Start with 5 seconds
                         for attempt in range(max_retries):
                             try:
+                                print(f"Attempting to post to Are.na (attempt {attempt + 1}/{max_retries})")
+                                print(f"Channel: {self.channel_slug}")
+                                print(f"Content: {content}")
+                                
+                                # Add a small delay to avoid rate limiting
+                                if attempt > 0:
+                                    time.sleep(2)  # Wait 2 seconds between retries
+                                
                                 self.arena_api.post_to_channel(self.channel_slug, content)
                                 print(f"Posted to Are.na: {alt_text}")
                                 self.last_published_alt_text = alt_text
@@ -474,11 +850,13 @@ class WebCrawler:
                                         json.dump(self.broken_images_data, f, indent=2)
                                 break
                             except Exception as e:
+                                print(f"Are.na posting failed on attempt {attempt + 1}: {e}")
                                 if attempt < max_retries - 1:  # Don't sleep on last attempt
+                                    print(f"Retrying in {retry_delay} seconds...")
                                     time.sleep(retry_delay)
                                     retry_delay *= 2  # Exponential backoff
                                 else:
-                                    print(f"Failed to post to Are.na: {e}")
+                                    print(f"Failed to post to Are.na after {max_retries} attempts: {e}")
                                     self.broken_images_count -= 1
 
             return broken_images_alt_texts
@@ -516,6 +894,10 @@ class WebCrawler:
     def continuous_crawl(self, interval=20):
         print("\nPress Ctrl+C to save and exit.")
         print(f"Total broken images found so far: {self.broken_images_count}")
+        if self.sound_notifications:
+            print("🔊 Sound notifications enabled - you'll hear a beep when broken images are found!")
+        else:
+            print("🔇 Sound notifications disabled")
         scrape_count = 0
         try:
             while True:
@@ -548,6 +930,62 @@ class WebCrawler:
             print("Exiting gracefully.")
             exit(0)
 
+    def test_image_url(self, url):
+        """Test a specific image URL to see if it's correctly identified as broken or valid"""
+        print(f"\n=== Testing URL: {url} ===")
+        
+        # Set current_url for context
+        self.current_url = "http://www.missouribotanicalgarden.org/plant-science/plant-science/resources/raven-library.aspx"
+        
+        try:
+            # Test the URL directly
+            response = requests.get(url, timeout=10, headers={
+                'User-Agent': 'Mozilla/5.0',
+                'Accept': 'image/*',
+                'Referer': self.current_url
+            })
+            
+            print(f"HTTP Status: {response.status_code}")
+            print(f"Content-Type: {response.headers.get('Content-Type', 'Unknown')}")
+            print(f"Content-Length: {response.headers.get('Content-Length', 'Unknown')}")
+            
+            if response.status_code == 200:
+                is_broken = self.is_broken_image(url)
+                print(f"Is broken: {is_broken}")
+                
+                # Show some content for debugging
+                content_preview = response.content[:200]
+                try:
+                    text_preview = content_preview.decode('utf-8', errors='ignore')
+                    print(f"Content preview: {text_preview[:100]}...")
+                except:
+                    print(f"Content preview (binary): {content_preview}")
+                
+                return not is_broken
+            else:
+                print(f"HTTP request failed with status {response.status_code}")
+                return False
+                
+        except Exception as e:
+            print(f"Error testing URL: {e}")
+            return False
+
+    def play_notification_sound(self):
+        """Play a notification sound when a broken image is found"""
+        if not self.sound_notifications:
+            return
+            
+        try:
+            if winsound:
+                # Windows - play a pleasant notification sound
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            else:
+                # Other platforms - try system bell
+                print("\a", end="", flush=True)  # ASCII bell character
+        except Exception as e:
+            # Fallback - just print a visual indicator
+            print("🔔 BROKEN IMAGE FOUND! 🔔")
+
 if __name__ == "__main__":
     arena_api = ArenaAPI()
     
@@ -557,6 +995,12 @@ if __name__ == "__main__":
     
     start_url = 'https://www.forumancientcoins.com/dougsmith/photo.html?srsltid=AfmBOooDh8XWrk5e34oyUy58lDdNCN18NxBprVDZXOlmSqZuAZXiV0TZ' 
     CHANNEL_SLUG = "broken-images-and-the-alt-text-that-remains"
+    
+    print(f"Testing channel access for '{CHANNEL_SLUG}'...")
+    if not arena_api.test_channel_access(CHANNEL_SLUG):
+        print("Channel access failed. Please check your permissions and channel slug.")
+        exit(1)
+    print("Channel access successful!")
     
     # Ensure crawler_state.json is in .gitignore
     gitignore_path = '.gitignore'
@@ -570,5 +1014,35 @@ if __name__ == "__main__":
             with open(gitignore_path, 'a') as f:
                 f.write('\ncrawler_state.json\n')
     
-    crawler = WebCrawler(start_url, arena_api, CHANNEL_SLUG)
+    # Create crawler with sound notifications enabled
+    # To disable sound notifications, change sound_notifications=False
+    crawler = WebCrawler(start_url, arena_api, CHANNEL_SLUG, sound_notifications=True)
+    
+    # Test the specific URLs that were incorrectly identified as broken
+    print("\n" + "="*50)
+    print("TESTING SVG URLS FROM BROKEN IMAGES")
+    print("="*50)
+    
+    test_urls = [
+        "http://www.missouribotanicalgarden.org/Portals/0/2022redesignassets/bh-logo-horiz.svg",
+        "http://www.missouribotanicalgarden.org/Portals/0/2022redesignassets/snr-logo-horiz.svg", 
+        "http://www.missouribotanicalgarden.org/Portals/0/2022redesignassets/mobot-logo.svg",
+        "http://www.missouribotanicalgarden.org/Portals/0/2022redesignassets/bh-logo.svg",
+        "http://www.missouribotanicalgarden.org/Portals/0/2022redesignassets/snr-logo.svg"
+    ]
+    
+    valid_count = 0
+    for url in test_urls:
+        if crawler.test_image_url(url):
+            valid_count += 1
+    
+    print(f"\nTest Results: {valid_count}/{len(test_urls)} URLs are now correctly identified as valid")
+    print("="*50)
+    
+    # Ask user if they want to continue with crawling
+    user_input = input("\nDo you want to continue with crawling? (y/n): ")
+    if user_input.lower() != 'y':
+        print("Exiting...")
+        exit(0)
+    
     crawler.continuous_crawl()
