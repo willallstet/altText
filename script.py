@@ -679,12 +679,24 @@ class WebCrawler:
         
         return False
 
+	def _is_shortener_url(self, url):
+		"""Return True if the URL belongs to a known shortener that should be skipped."""
+		try:
+			netloc = urlparse(url).netloc.lower()
+			blocked_domains = ('bit.ly', 'tinyurl.com')
+			for domain in blocked_domains:
+				if netloc == domain or netloc.endswith('.' + domain):
+					return True
+			return False
+		except Exception:
+			return False
+
     def extract_links(self, soup, base_url):
         links = []
         for a_tag in soup.find_all('a', href=True):
             href = a_tag['href']
             absolute_url = urljoin(base_url, href)
-            if absolute_url.startswith(('http://', 'https://')):
+			if absolute_url.startswith(('http://', 'https://')) and not self._is_shortener_url(absolute_url):
                 links.append(absolute_url)
         return links
 
@@ -871,7 +883,10 @@ class WebCrawler:
         for link in links:
             if added >= max_to_add:
                 break
-            if link not in self.visited_urls and link not in self.url_queue:
+			if link not in self.visited_urls and link not in self.url_queue:
+				# Skip known URL shorteners
+				if self._is_shortener_url(link):
+					continue
                 try:
                     response = requests.get(link, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
                     if response.status_code == 200:
