@@ -7,7 +7,7 @@ import random
 import http.server
 import socketserver
 import webbrowser
-from urllib.parse import parse_qs, urlparse, urlunparse
+from urllib.parse import parse_qs, urlparse, urlunparse, quote
 import threading
 import json
 import ssl
@@ -20,6 +20,7 @@ import atexit
 from PIL import Image
 import io
 import sys
+from playwright.sync_api import sync_playwright
 
 # Platform-specific sound imports
 try:
@@ -84,13 +85,44 @@ class ArenaAPI:
         
         # Create a session to maintain cookies and connection pooling
         self.session = requests.Session()
+        # Set default headers for the session to look more like a real browser
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
+        })
         
         if not self.access_token and not (self.client_id and self.client_secret):
             raise ValueError("Either access_token or both client_id and client_secret must be provided")
 
+    def _establish_session(self):
+        """Establish a session with Are.na to get Cloudflare cookies"""
+        try:
+            # Visit the main site first to establish a session and get Cloudflare cookies
+            print("Establishing session with Are.na...")
+            response = self.session.get('https://are.na/', timeout=10)
+            if response.status_code == 200:
+                print("✅ Session established successfully")
+                return True
+            else:
+                print(f"⚠️ Session establishment returned status {response.status_code}")
+                return False
+        except Exception as e:
+            print(f"⚠️ Could not establish session: {e}")
+            return False
+    
     def get_authorization(self):
         if self.access_token:
             print("Using existing access token")
+            # Establish session before testing token
+            self._establish_session()
             # Test the token to make sure it's valid
             if self.test_access_token():
                 print("Access token is valid")
@@ -191,7 +223,7 @@ class ArenaAPI:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept-Encoding': 'gzip, deflate',
             'Connection': 'keep-alive',
             'Content-Type': 'application/x-www-form-urlencoded',
             'Origin': 'https://dev.are.na',
@@ -241,40 +273,63 @@ class ArenaAPI:
         try:
             # Test the token with a simple API call (get user info)
             url = "https://api.are.na/v2/me"
+            # Use simpler headers to avoid Cloudflare blocking
             headers = {
                 'Authorization': f'Bearer {self.access_token}',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept': 'application/json, text/plain, */*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Connection': 'keep-alive',
-                'Referer': 'https://are.na/',
-                'Sec-Fetch-Dest': 'empty',
-                'Sec-Fetch-Mode': 'cors',
-                'Sec-Fetch-Site': 'same-origin'
+                'Accept': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
             }
             response = self.session.get(url, headers=headers, timeout=10)
-            return response.status_code == 200
+            
+            if response.status_code == 200:
+                try:
+                    user_data = response.json()
+                    print(f"✅ Token is valid! Authenticated as: {user_data.get('username', 'Unknown')}")
+                    return True
+                except:
+                    print("✅ Token is valid (got 200 response)")
+                    return True
+            elif response.status_code == 401:
+                print("❌ Token is INVALID or EXPIRED (401 Unauthorized)")
+                print("   You need to get a new access token.")
+                return False
+            elif response.status_code == 403:
+                print("⚠️  Got 403 - could be Cloudflare blocking OR invalid token")
+                # Try to see if we can decode the response
+                try:
+                    error_text = response.text[:200]
+                    if 'cloudflare' in error_text.lower() or 'cf-ray' in error_text.lower():
+                        print("   This looks like Cloudflare blocking, not an auth issue")
+                    else:
+                        print(f"   Response: {error_text}")
+                except:
+                    pass
+                return False
+            else:
+                print(f"⚠️  Unexpected status code: {response.status_code}")
+                return False
         except Exception as e:
-            print(f"Error testing access token: {e}")
+            print(f"❌ Error testing access token: {e}")
             return False
     
     def test_channel_access(self, channel_slug):
         """Test if the channel exists and is accessible"""
         if not self.access_token:
             return False
-            
+        
+        # Establish session first to get Cloudflare cookies
+        self._establish_session()
+        time.sleep(0.2)  # Give Cloudflare a moment to process
+        
         try:
             url = f"https://api.are.na/v2/channels/{channel_slug}"
+            # Add a small delay to avoid triggering rate limits
+            time.sleep(0.1)
+            # Use simpler headers for API calls - Cloudflare might be blocking complex headers
             headers = {
                 'Authorization': f'Bearer {self.access_token}',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept': 'application/json, text/plain, */*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Connection': 'keep-alive',
-                'Referer': 'https://are.na/',
-                'Sec-Fetch-Dest': 'empty',
-                'Sec-Fetch-Mode': 'cors',
-                'Sec-Fetch-Site': 'same-origin'
+                'Accept': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
             }
             
             print(f"🔍 Testing channel access: {url}")
@@ -284,7 +339,26 @@ class ArenaAPI:
             
             print(f"📊 Response status: {response.status_code}")
             print(f"📄 Response encoding: {response.encoding}")
-            print(f"🔍 Response content preview: {response.text[:200]}...")
+            
+            # Try to decode the response properly
+            try:
+                # Check if response is compressed
+                content_encoding = response.headers.get('Content-Encoding', '')
+                if content_encoding:
+                    print(f"📦 Content-Encoding: {content_encoding}")
+                
+                # Try to get text (requests should auto-decompress)
+                response_text = response.text
+                print(f"🔍 Response content preview: {response_text[:200]}...")
+            except Exception as e:
+                print(f"⚠️ Error decoding response: {e}")
+                # Try to decode as UTF-8 with error handling
+                try:
+                    response_text = response.content.decode('utf-8', errors='ignore')
+                    print(f"🔍 Response content (fallback): {response_text[:200]}...")
+                except:
+                    response_text = str(response.content[:200])
+                    print(f"🔍 Response content (raw): {response_text}...")
             
             if response.status_code == 200:
                 try:
@@ -299,7 +373,14 @@ class ArenaAPI:
                     return False
             else:
                 print(f"❌ Channel access failed: Status {response.status_code}")
-                print(f"🔍 Error response: {response.text}")
+                try:
+                    error_text = response.text
+                except:
+                    try:
+                        error_text = response.content.decode('utf-8', errors='ignore')
+                    except:
+                        error_text = str(response.content[:500])
+                print(f"🔍 Error response: {error_text[:500]}")
                 if response.status_code == 404:
                     print("Channel not found. Please check the channel slug.")
                 elif response.status_code == 403:
@@ -313,21 +394,15 @@ class ArenaAPI:
         if not self.access_token:
             raise Exception("Not authenticated. Call get_authorization() first.")
             
-        url = f"https://api.are.na/v2/channels/{channel_slug}/blocks"  
+        url = f"https://api.are.na/v2/channels/{channel_slug}/blocks"
+        # Add a small delay to avoid triggering rate limits
+        time.sleep(0.1)
+        # Use simpler headers for API calls - Cloudflare might be blocking complex headers
         headers = {
             'Authorization': f'Bearer {self.access_token}',
             'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Connection': 'keep-alive',
-            'Origin': 'https://are.na',
-            'Referer': 'https://are.na/',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'same-origin',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache'
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         }
         
         print(f"📡 Posting to Are.na: {url}")
@@ -397,6 +472,28 @@ class WebCrawler:
         self.broken_images_file = 'broken_images.json'
         self.broken_images_data = self.load_broken_images()
 
+        # Launch a persistent headless browser for accurate broken-image detection
+        self._pw = sync_playwright().start()
+        self._browser = self._pw.chromium.launch(headless=True)
+        self._browser_context = self._browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            ignore_https_errors=True,
+        )
+
+    def _close_browser(self):
+        try:
+            self._browser_context.close()
+        except Exception:
+            pass
+        try:
+            self._browser.close()
+        except Exception:
+            pass
+        try:
+            self._pw.stop()
+        except Exception:
+            pass
+
     def save_state(self):
         state = {
             'url_queue': list(self.url_queue),
@@ -435,268 +532,27 @@ class WebCrawler:
     def handle_exit(self, signum, frame):
         print("\nSaving state before exit...")
         self.save_state()
+        self._close_browser()
         exit(0)
 
-    def is_broken_image(self, url):
+    def _is_shortener_url(self, url):
+        """Return True if the URL belongs to a known shortener that should be skipped."""
         try:
-            # Resolve relative URLs against current page
-            if not url.startswith(('http://', 'https://')):
-                base_dir = self._get_base_directory_url(self.current_url)
-                primary_url = urljoin(base_dir, url)
-                fallback_url = urljoin(self.current_url, url)
-            else:
-                primary_url = url
-                fallback_url = url
-
-            # First probe: with Referer
-            if self._probe_image_valid(primary_url, referer=self.current_url):
-                return False
-
-            # If relative and first probe failed, try fallback resolved URL
-            if fallback_url != primary_url and self._probe_image_valid(fallback_url, referer=self.current_url):
-                return False
-
-            # Second probe: without Referer (some CDNs block hotlinking)
-            if self._probe_image_valid(primary_url, referer=None, user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Safari/605.1.15'):
-                return False
-
-            return True
-
-        except requests.RequestException:
-            return True
-
-    def _probe_image_valid(self, img_url, referer=None, user_agent=None):
-        """Lightweight probe to determine if an image URL is valid without downloading the whole body."""
-        headers = {
-            'User-Agent': user_agent or 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'image/*',
-            'Accept-Encoding': 'identity',  # avoid compressed HTML error pages
-        }
-        if referer:
-            headers['Referer'] = referer
-
-        try:
-            with requests.get(img_url, headers=headers, timeout=10, stream=True, allow_redirects=True) as resp:
-                # HTTP status must be OK
-                if resp.status_code < 200 or resp.status_code >= 300:
-                    return False
-
-                content_type = (resp.headers.get('Content-Type') or '').lower()
-                content_length = resp.headers.get('Content-Length')
-
-                # Read a small chunk to sniff content (do not download full file)
-                chunk = b''
-                for data in resp.iter_content(chunk_size=4096):
-                    chunk = data or b''
-                    break
-
-                # Empty body → likely invalid
-                if not chunk:
-                    return False
-
-                # If we inadvertently received HTML/JSON, it's not an image
-                head_lower = chunk[:256].lower()
-                if b'<html' in head_lower or b'<!doctype' in head_lower or head_lower.strip().startswith((b'{', b'[')):
-                    return False
-
-                # If server claims an image type and gave us bytes, consider valid
-                if content_type.startswith('image/'):
+            netloc = urlparse(url).netloc.lower()
+            blocked_domains = ('bit.ly', 'tinyurl.com')
+            for domain in blocked_domains:
+                if netloc == domain or netloc.endswith('.' + domain):
                     return True
-
-                # Otherwise, try magic-byte sniffing for common image formats
-                if self._detect_image_format_by_signature(chunk):
-                    return True
-
-                # As a final heuristic: if content-length header exists and is sensible (> 50 bytes), accept
-                try:
-                    if content_length is not None and int(content_length) > 50:
-                        return True
-                except Exception:
-                    pass
-
-                return False
-        except requests.RequestException:
             return False
-
-    def _get_base_directory_url(self, page_url):
-        """Return the proper base directory URL for resolving relative resources."""
-        p = urlparse(page_url)
-        path = p.path or '/'
-        if path.endswith('/'):
-            dir_path = path
-        else:
-            last_segment = path.rsplit('/', 1)[-1]
-            if '.' in last_segment:
-                # Looks like a file: drop filename
-                dir_path = path.rsplit('/', 1)[0] + '/'
-                if dir_path == '//':
-                    dir_path = '/'
-            else:
-                # Looks like a directory without trailing '/'
-                dir_path = path + '/'
-        return urlunparse((p.scheme, p.netloc, dir_path, '', '', ''))
-
-    def _validate_image_response(self, response, img_url):
-        """
-        Comprehensive image validation using multiple checks:
-        1. HTTP status code
-        2. Content-Type header
-        3. Content-Length (file size)
-        4. PIL image verification (for raster images)
-        5. SVG validation (for vector graphics)
-        6. Image format detection
-        """
-        try:
-            # Check HTTP status
-            if response.status_code != 200:
-                return False
-            
-            # Check Content-Type header
-            content_type = response.headers.get('Content-Type', '').lower()
-            if not content_type.startswith('image/'):
-                # Sometimes images are served with generic content types
-                if 'text/html' in content_type:
-                    return False
-                if 'application/json' in content_type:
-                    return False
-                # Allow SVG files which might be served as text/xml or application/xml
-                if 'xml' in content_type and img_url.lower().endswith('.svg'):
-                    pass  # Continue with SVG validation
-                elif not content_type.startswith(('application/octet-stream', 'binary/')):
-                    return False
-            
-            # Check Content-Length (file size)
-            content_length = response.headers.get('Content-Length')
-            if content_length:
-                try:
-                    size = int(content_length)
-                    if size < 50:  # Suspiciously small files are likely error pages
-                        return False
-                    if size > 10 * 1024 * 1024:  # Skip very large files (>10MB)
-                        return False
-                except ValueError:
-                    pass
-            
-            # Get image content
-            image_data = response.content
-            
-            # Check if content is suspiciously small
-            if len(image_data) < 50:
-                return False
-            
-            # Check for HTML content (common for broken image URLs)
-            if b'<html' in image_data.lower()[:200] or b'<!doctype' in image_data.lower()[:200]:
-                return False
-            
-            # Check for JSON content
-            if image_data.strip().startswith(b'{') or image_data.strip().startswith(b'['):
-                return False
-            
-            # Special handling for SVG files
-            if img_url.lower().endswith('.svg') or 'image/svg' in content_type:
-                return self._validate_svg_content(image_data)
-            
-            # Use PIL to verify raster image integrity and detect format
-            try:
-                with Image.open(io.BytesIO(image_data)) as img:
-                    img_format = img.format
-                    img.verify()  # This will raise an exception if the image is corrupted
-                    return True
-            except Exception:
-                # Try to detect HEIC format manually (not supported by PIL)
-                if len(image_data) >= 12:
-                    heic_signatures = [b'ftypheic', b'ftypheix', b'ftyphevc', b'ftyphevx']
-                    if image_data[4:12] in heic_signatures:
-                        return True
-                
-                # Try to detect other formats by file signature
-                if self._detect_image_format_by_signature(image_data):
-                    return True
-                
-                return False
-                
         except Exception:
             return False
-
-    def _validate_svg_content(self, svg_data):
-        """
-        Validate SVG content by checking for SVG-specific elements
-        """
-        try:
-            # Convert to string for text-based validation
-            svg_text = svg_data.decode('utf-8', errors='ignore').lower()
-            
-            # Check for SVG signature and basic structure
-            if '<svg' in svg_text and ('xmlns' in svg_text or 'viewbox' in svg_text):
-                # Make sure it's not an error page disguised as SVG
-                if 'error' in svg_text or 'not found' in svg_text or '404' in svg_text:
-                    return False
-                return True
-            
-            # Also check for XML declaration with SVG
-            if '<?xml' in svg_text and '<svg' in svg_text:
-                return True
-                
-            return False
-            
-        except Exception:
-            return False
-
-    def _detect_image_format_by_signature(self, image_data):
-        """
-        Detect image format by file signature (magic numbers)
-        """
-        if len(image_data) < 4:
-            return False
-        
-        # Common image format signatures
-        signatures = {
-            b'\xff\xd8\xff': 'JPEG',
-            b'\x89PNG\r\n\x1a\n': 'PNG',
-            b'GIF87a': 'GIF',
-            b'GIF89a': 'GIF',
-            b'BM': 'BMP',
-            b'II*\x00': 'TIFF',
-            b'MM\x00*': 'TIFF',
-            b'\x00\x00\x01\x00': 'ICO',
-            b'\x00\x00\x02\x00': 'CUR',
-        }
-        
-        for signature, format_name in signatures.items():
-            if image_data.startswith(signature):
-                return True
-        
-        # Special check for WebP (needs more bytes to verify)
-        if len(image_data) >= 12 and image_data.startswith(b'RIFF') and image_data[8:12] == b'WEBP':
-            return True
-        
-        # Special check for SVG files (XML-based)
-        if len(image_data) >= 5:
-            # Check for XML declaration or direct SVG tag
-            text_start = image_data[:100].decode('utf-8', errors='ignore').lower()
-            if '<?xml' in text_start or '<svg' in text_start:
-                return True
-        
-        return False
-
-	def _is_shortener_url(self, url):
-		"""Return True if the URL belongs to a known shortener that should be skipped."""
-		try:
-			netloc = urlparse(url).netloc.lower()
-			blocked_domains = ('bit.ly', 'tinyurl.com')
-			for domain in blocked_domains:
-				if netloc == domain or netloc.endswith('.' + domain):
-					return True
-			return False
-		except Exception:
-			return False
 
     def extract_links(self, soup, base_url):
         links = []
         for a_tag in soup.find_all('a', href=True):
             href = a_tag['href']
             absolute_url = urljoin(base_url, href)
-			if absolute_url.startswith(('http://', 'https://')) and not self._is_shortener_url(absolute_url):
+            if absolute_url.startswith(('http://', 'https://')) and not self._is_shortener_url(absolute_url):
                 links.append(absolute_url)
         return links
 
@@ -752,130 +608,124 @@ class WebCrawler:
         return False
 
     def crawl_page_for_broken_images(self, url):
+        page = self._browser_context.new_page()
         try:
-            # Set the current URL at the start of crawling
-            self.current_url = url
-            
-            response = requests.get(url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
-            soup = BeautifulSoup(response.text, 'html.parser')
+            # Load the page in a real browser and wait for network to settle
+            page.goto(url, wait_until='networkidle', timeout=30000)
+            effective_url = page.url
+            self.current_url = effective_url
 
-            # Extract and sort links
-            links = self.extract_links(soup, url)
-            current_domain = '/'.join(url.split('/')[:3])
-            
-            # Separate links by domain
-            external_links = [link for link in links if '/'.join(link.split('/')[:3]) != current_domain]
-            internal_links = [link for link in links if '/'.join(link.split('/')[:3]) == current_domain]
-            random.shuffle(external_links)
-            random.shuffle(internal_links)
-            
-            # Add up to 10 links, prioritizing external ones
-            links_added = 0
-            
-            # Try external links first (up to 6)
-            links_added += self._add_links_to_queue(external_links, "external", links_added, 6)
-            
-            # Add internal links if we haven't reached 10 yet
-            links_added += self._add_links_to_queue(internal_links, "internal", links_added, 10 - links_added)
+            # Ask the browser which images show the broken-image icon.
+            # img.complete==true && img.naturalWidth==0 is the standard browser check.
+            broken_imgs = page.evaluate("""() =>
+                Array.from(document.querySelectorAll('img'))
+                    .filter(img => img.complete && img.naturalWidth === 0 && img.src)
+                    .map(img => ({ src: img.src, alt: img.getAttribute('alt') || '' }))
+            """)
 
-            img_tags = soup.find_all('img')
-            broken_images_alt_texts = []
+            # Extract links for the crawl queue from the live page HTML
+            html = page.content()
+            soup = BeautifulSoup(html, 'html.parser')
+            links = self.extract_links(soup, effective_url)
 
-            for img in img_tags:
-                img_url = img.get('src')
-                if not img_url:
-                    continue
-                
-                img_url = urljoin(url, img_url)
-                if not img_url.startswith(('http://', 'https://')):
-                    continue
-                
-                # Skip certain file types entirely
-                if img_url.lower().endswith(('.svg', '.avif')):
-                    continue
-                
-                # Skip tiny tracking pixels and spacer images
-                img_filename = img_url.split('/')[-1].lower()
-                skip_patterns = ['1px.gif', 'blank.gif', 'spacer.gif', 'pixel.gif', 'clear.gif', 
-                               'transparent.gif', 'empty.gif', 'invisible.gif', '1x1.gif', 
-                               'dot.gif', 'space.gif', 'tracker.gif', '0x0.gif']
-                if any(pattern in img_filename for pattern in skip_patterns):
-                    continue
-                
-                if self.is_broken_image(img_url):
-                    alt_text = img.get('alt', '')
-
-                    # Only process alt text with more than one word
-                    if alt_text and len(alt_text.split()) > 1:
-                        # Check if this exact combination was already saved
-                        if self.is_duplicate_broken_image(img_url, alt_text, url):
-                            continue
-                        
-                        # Save the broken image data and continue with posting
-                        self.save_broken_image(img_url, alt_text, url)
-                        
-                        if alt_text == self.last_published_alt_text:
-                            continue
-                        
-                        broken_images_alt_texts.append(alt_text)
-                        
-                        # Play notification sound for broken image
-                        self.play_notification_sound()
-                        
-                        print(f"🚨 BROKEN IMAGE FOUND: {alt_text} 🚨")
-                        
-                        self.broken_images_count += 1
-                        
-                        self.recent_posts.append(url)
-                        if len(self.recent_posts) > self.max_recent_posts:
-                            self.recent_posts.pop(0)
-                        self.check_and_reorder_queue(url)
-                        
-                        img_filename = img_url.split('/')[-1]
-                        
-                        content = {
-                            'content': f'{alt_text}',
-                            'title': alt_text,
-                            'description': f'page url: *{url}*\nimage url: *{img_url}*',
-                        }
-
-                        # Add retry logic for Are.na posting
-                        max_retries = 3
-                        retry_delay = 5  # Start with 5 seconds
-                        for attempt in range(max_retries):
-                            try:
-                                print(f"Attempting to post to Are.na (attempt {attempt + 1}/{max_retries})")
-                                print(f"Channel: {self.channel_slug}")
-                                print(f"Content: {content}")
-                                
-                                # Add a small delay to avoid rate limiting
-                                if attempt > 0:
-                                    time.sleep(2)  # Wait 2 seconds between retries
-                                
-                                self.arena_api.post_to_channel(self.channel_slug, content)
-                                print(f"Posted to Are.na: {alt_text}")
-                                self.last_published_alt_text = alt_text
-                                # Update the last entry's arena_post_success status
-                                if self.broken_images_data:
-                                    self.broken_images_data[-1]['arena_post_success'] = True
-                                    with open(self.broken_images_file, 'w') as f:
-                                        json.dump(self.broken_images_data, f, indent=2)
-                                break
-                            except Exception as e:
-                                print(f"Are.na posting failed on attempt {attempt + 1}: {e}")
-                                if attempt < max_retries - 1:  # Don't sleep on last attempt
-                                    print(f"Retrying in {retry_delay} seconds...")
-                                    time.sleep(retry_delay)
-                                    retry_delay *= 2  # Exponential backoff
-                                else:
-                                    print(f"Failed to post to Are.na after {max_retries} attempts: {e}")
-                                    self.broken_images_count -= 1
-
-            return broken_images_alt_texts
-
-        except requests.RequestException as e:
+        except Exception as e:
             print(f"Error crawling page {url}: {e}")
+            page.close()
             return []
+        finally:
+            page.close()
+
+        # Queue discovered links
+        current_domain = '/'.join(url.split('/')[:3])
+        external_links = [l for l in links if '/'.join(l.split('/')[:3]) != current_domain]
+        internal_links = [l for l in links if '/'.join(l.split('/')[:3]) == current_domain]
+        random.shuffle(external_links)
+        random.shuffle(internal_links)
+        links_added = 0
+        links_added += self._add_links_to_queue(external_links, "external", links_added, 6)
+        links_added += self._add_links_to_queue(internal_links, "internal", links_added, 10 - links_added)
+
+        skip_patterns = ['1px.gif', 'blank.gif', 'spacer.gif', 'pixel.gif', 'clear.gif',
+                         'transparent.gif', 'empty.gif', 'invisible.gif', '1x1.gif',
+                         'dot.gif', 'space.gif', 'tracker.gif', '0x0.gif']
+
+        broken_images_alt_texts = []
+
+        for img_data in broken_imgs:
+            img_url = img_data['src']
+            alt_text = img_data['alt']
+
+            if not img_url.startswith(('http://', 'https://')):
+                continue
+
+            # Skip SVG/AVIF (browsers handle these differently)
+            if img_url.lower().endswith(('.svg', '.avif')):
+                continue
+
+            # Skip tracking pixels and spacer images
+            img_filename = img_url.split('/')[-1].lower()
+            if any(pattern in img_filename for pattern in skip_patterns):
+                continue
+
+            # Only process alt text with more than one word
+            if not alt_text or len(alt_text.split()) <= 1:
+                continue
+
+            # Skip duplicates
+            if self.is_duplicate_broken_image(img_url, alt_text, effective_url):
+                continue
+
+            self.save_broken_image(img_url, alt_text, effective_url)
+
+            if alt_text == self.last_published_alt_text:
+                continue
+
+            broken_images_alt_texts.append(alt_text)
+            self.play_notification_sound()
+            print(f"🚨 BROKEN IMAGE FOUND: {alt_text} 🚨")
+            self.broken_images_count += 1
+
+            self.recent_posts.append(url)
+            if len(self.recent_posts) > self.max_recent_posts:
+                self.recent_posts.pop(0)
+            self.check_and_reorder_queue(url)
+
+            content = {
+                'content': f'{alt_text}',
+                'title': alt_text,
+                'description': f'page url: *{effective_url}*\nimage url: *{img_url}*',
+            }
+
+            max_retries = 3
+            retry_delay = 1
+            for attempt in range(max_retries):
+                try:
+                    print(f"Attempting to post to Are.na (attempt {attempt + 1}/{max_retries})")
+                    print(f"Channel: {self.channel_slug}")
+                    print(f"Content: {content}")
+
+                    if attempt > 0:
+                        time.sleep(0.1)
+
+                    self.arena_api.post_to_channel(self.channel_slug, content)
+                    print(f"Posted to Are.na: {alt_text}")
+                    self.last_published_alt_text = alt_text
+                    if self.broken_images_data:
+                        self.broken_images_data[-1]['arena_post_success'] = True
+                        with open(self.broken_images_file, 'w') as f:
+                            json.dump(self.broken_images_data, f, indent=2)
+                    break
+                except Exception as e:
+                    print(f"Are.na posting failed on attempt {attempt + 1}: {e}")
+                    if attempt < max_retries - 1:
+                        print(f"Retrying in {retry_delay} seconds...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                    else:
+                        print(f"Failed to post to Are.na after {max_retries} attempts: {e}")
+                        self.broken_images_count -= 1
+
+        return broken_images_alt_texts
 
     def _add_links_to_queue(self, links, link_type, current_count, max_to_add):
         """Helper method to add links to the queue with validation"""
@@ -883,17 +733,23 @@ class WebCrawler:
         for link in links:
             if added >= max_to_add:
                 break
-			if link not in self.visited_urls and link not in self.url_queue:
-				# Skip known URL shorteners
-				if self._is_shortener_url(link):
-					continue
-                try:
-                    response = requests.get(link, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
-                    if response.status_code == 200:
-                        self.url_queue.append(link)
-                        added += 1
-                except requests.RequestException:
+            if link not in self.visited_urls and link not in self.url_queue:
+                # Skip known URL shorteners
+                if self._is_shortener_url(link):
                     continue
+
+                # Validate that the link is a well-formed HTTP(S) URL before enqueueing.
+                # We avoid doing a network request here; any connection issues will be
+                # handled when we actually crawl the page.
+                try:
+                    parsed = urlparse(link)
+                    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+                        continue
+                except Exception:
+                    continue
+
+                self.url_queue.append(link)
+                added += 1
         return added
 
     def get_next_url(self):
@@ -906,7 +762,7 @@ class WebCrawler:
             return random.choice(list(self.known_domains))
         return self.start_url
 
-    def continuous_crawl(self, interval=20):
+    def continuous_crawl(self, interval=5):
         print("\nPress Ctrl+C to save and exit.")
         print(f"Total broken images found so far: {self.broken_images_count}")
         if self.sound_notifications:
@@ -948,42 +804,24 @@ class WebCrawler:
     def test_image_url(self, url):
         """Test a specific image URL to see if it's correctly identified as broken or valid"""
         print(f"\n=== Testing URL: {url} ===")
-        
-        # Set current_url for context
-        self.current_url = "http://www.missouribotanicalgarden.org/plant-science/plant-science/resources/raven-library.aspx"
-        
+        page = self._browser_context.new_page()
         try:
-            # Test the URL directly
-            response = requests.get(url, timeout=10, headers={
-                'User-Agent': 'Mozilla/5.0',
-                'Accept': 'image/*',
-                'Referer': self.current_url
-            })
-            
-            print(f"HTTP Status: {response.status_code}")
-            print(f"Content-Type: {response.headers.get('Content-Type', 'Unknown')}")
-            print(f"Content-Length: {response.headers.get('Content-Length', 'Unknown')}")
-            
-            if response.status_code == 200:
-                is_broken = self.is_broken_image(url)
-                print(f"Is broken: {is_broken}")
-                
-                # Show some content for debugging
-                content_preview = response.content[:200]
-                try:
-                    text_preview = content_preview.decode('utf-8', errors='ignore')
-                    print(f"Content preview: {text_preview[:100]}...")
-                except:
-                    print(f"Content preview (binary): {content_preview}")
-                
-                return not is_broken
-            else:
-                print(f"HTTP request failed with status {response.status_code}")
-                return False
-                
+            # Build a minimal page that contains only this image so the browser
+            # can tell us whether it renders or shows the broken icon.
+            page.set_content(f'<html><body><img id="img" src="{url}"></body></html>',
+                             wait_until='networkidle')
+            result = page.evaluate("""() => {
+                const img = document.getElementById('img');
+                return { complete: img.complete, naturalWidth: img.naturalWidth };
+            }""")
+            is_broken = result['complete'] and result['naturalWidth'] == 0
+            print(f"complete={result['complete']}  naturalWidth={result['naturalWidth']}  broken={is_broken}")
+            return not is_broken
         except Exception as e:
             print(f"Error testing URL: {e}")
             return False
+        finally:
+            page.close()
 
     def play_notification_sound(self):
         """Play a notification sound when a broken image is found"""
