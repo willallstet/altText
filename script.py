@@ -21,6 +21,14 @@ from PIL import Image
 import io
 import sys
 from playwright.sync_api import sync_playwright
+from requests.exceptions import ConnectionError, Timeout, RequestException
+
+# Try to import Playwright TimeoutError, fallback to checking by name if not available
+try:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+except ImportError:
+    # If direct import fails, we'll check by exception type name instead
+    PlaywrightTimeoutError = None
 
 # Platform-specific sound imports
 try:
@@ -319,12 +327,9 @@ class ArenaAPI:
         
         # Establish session first to get Cloudflare cookies
         self._establish_session()
-        time.sleep(0.2)  # Give Cloudflare a moment to process
-        
+
         try:
             url = f"https://api.are.na/v2/channels/{channel_slug}"
-            # Add a small delay to avoid triggering rate limits
-            time.sleep(0.1)
             # Use simpler headers for API calls - Cloudflare might be blocking complex headers
             headers = {
                 'Authorization': f'Bearer {self.access_token}',
@@ -395,8 +400,6 @@ class ArenaAPI:
             raise Exception("Not authenticated. Call get_authorization() first.")
             
         url = f"https://api.are.na/v2/channels/{channel_slug}/blocks"
-        # Add a small delay to avoid triggering rate limits
-        time.sleep(0.1)
         # Use simpler headers for API calls - Cloudflare might be blocking complex headers
         headers = {
             'Authorization': f'Bearer {self.access_token}',
@@ -460,6 +463,7 @@ class WebCrawler:
             self.visited_urls = set()
             self.known_domains = set()
             self.broken_images_count = 0
+            self.last_arena_post_time = None
         
         atexit.register(self.save_state)
         signal.signal(signal.SIGINT, self.handle_exit)
@@ -468,6 +472,16 @@ class WebCrawler:
         self.last_published_alt_text = None
         self.recent_posts = []
         self.max_recent_posts = 10
+        
+        # Rate limiting: track last time an image was posted to are.na
+        # Ensure it's initialized (load_state may have set it, or it's None for new crawls)
+        if not hasattr(self, 'last_arena_post_time'):
+            self.last_arena_post_time = None
+        self.arena_post_interval = 600  # 10 minutes in seconds
+
+        # Queue for images waiting to be posted to are.na (persists between sessions)
+        self.post_queue_file = 'post_queue.json'
+        self.post_queue = self.load_post_queue()
 
         self.broken_images_file = 'broken_images.json'
         self.broken_images_data = self.load_broken_images()
@@ -479,6 +493,11 @@ class WebCrawler:
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             ignore_https_errors=True,
         )
+        
+        # Network connectivity tracking
+        self.network_paused = False
+        # Track retry attempts for URLs to prevent infinite loops
+        self.url_retry_count = {}
 
     def _close_browser(self):
         try:
@@ -493,6 +512,126 @@ class WebCrawler:
             self._pw.stop()
         except Exception:
             pass
+    
+    def check_network_connectivity(self):
+        """Check if network connectivity is available by trying to reach a reliable server"""
+        test_urls = [
+            'https://www.google.com',
+            'http://8.8.8.8',  # Google DNS (HTTP for IP addresses)
+            'http://1.1.1.1',  # Cloudflare DNS (HTTP for IP addresses)
+        ]
+        
+        for url in test_urls:
+            try:
+                response = requests.get(url, timeout=5, allow_redirects=False)
+                # Accept any response status as long as we got a response (means network is up)
+                return True
+            except (ConnectionError, Timeout, RequestException) as e:
+                # These are expected network errors - continue to next URL
+                continue
+            except Exception as e:
+                # Unexpected errors - log but continue checking
+                continue
+        return False
+    
+    def wait_for_network_recovery(self, check_interval=10):
+        """Wait for network connectivity to be restored"""
+        if not self.network_paused:
+            return
+        
+        print(f"\n⏸️  Network connectivity lost. Pausing queue processing...")
+        print(f"📡 Waiting for network to recover (checking every {check_interval} seconds)...")
+        print(f"Press Ctrl+C to exit (will save state)")
+        
+        while self.network_paused:
+            try:
+                if self.check_network_connectivity():
+                    print(f"✅ Network connectivity restored! Resuming queue processing...")
+                    self.network_paused = False
+                    return
+                else:
+                    print(f"⏳ Still waiting for network... (Queue: {len(self.url_queue)} URLs pending)")
+                    # Sleep in smaller increments to allow KeyboardInterrupt to be caught
+                    for _ in range(check_interval):
+                        time.sleep(1)
+            except KeyboardInterrupt:
+                # Re-raise to be handled by the main loop
+                raise
+    
+    def _is_network_error(self, exception):
+        """Check if an exception is a network connectivity error"""
+        error_str = str(exception).lower()
+        
+        # Exclude non-network errors first
+        non_network_indicators = [
+            'download is starting',
+            'download',
+            'navigation was interrupted',
+            'target closed',
+            'page closed',
+            'context closed',
+            'browser closed',
+            'page.goto: timeout',
+            'navigation timeout',
+            'waiting for',
+            'err_http2_protocol_error',
+            'err_http2',
+            'protocol error',
+            'http2',
+            'http/2',
+            'server error',
+            '502',
+            '503',
+            '504',
+            '500',
+        ]
+        
+        # If error contains non-network indicators, it's not a network error
+        if any(indicator in error_str for indicator in non_network_indicators):
+            return False
+        
+        network_error_types = [
+            ConnectionError,
+            Timeout,
+            RequestException,
+        ]
+        
+        # Add PlaywrightTimeoutError if available
+        if PlaywrightTimeoutError is not None:
+            network_error_types.append(PlaywrightTimeoutError)
+        
+        # Check exception type
+        if isinstance(exception, tuple(network_error_types)):
+            # Double-check it's not a download-related timeout
+            if 'download' in error_str:
+                return False
+            return True
+        
+        # Also check by exception type name (for Playwright timeout errors)
+        exception_type_name = type(exception).__name__
+        if 'TimeoutError' in exception_type_name or 'Timeout' in exception_type_name:
+            # Exclude download-related timeouts
+            if 'download' in error_str:
+                return False
+            return True
+        
+        # Check exception message for network-related keywords
+        network_keywords = [
+            'connection',
+            'network',
+            'dns',
+            'resolve',
+            'unreachable',
+            'refused',
+            'reset',
+            'no internet',
+            'offline',
+            'connection refused',
+            'connection reset',
+            'name resolution',
+        ]
+        
+        return any(keyword in error_str for keyword in network_keywords)
 
     def save_state(self):
         state = {
@@ -500,12 +639,15 @@ class WebCrawler:
             'visited_urls': list(self.visited_urls),
             'known_domains': list(self.known_domains),
             'start_url': self.start_url,
-            'broken_images_count': self.broken_images_count
+            'broken_images_count': self.broken_images_count,
+            'last_arena_post_time': self.last_arena_post_time
         }
         
         with open(self.state_file, 'w') as f:
             json.dump(state, f)
-        print(f"State saved. Total broken images: {self.broken_images_count}")
+        # Also save post queue
+        self.save_post_queue()
+        print(f"State saved. Total broken images: {self.broken_images_count}, Post queue: {len(self.post_queue)}")
 
     def load_state(self):
         try:
@@ -516,6 +658,7 @@ class WebCrawler:
             self.visited_urls = set(state['visited_urls'])
             self.known_domains = set(state['known_domains'])
             self.broken_images_count = state.get('broken_images_count', 0)
+            self.last_arena_post_time = state.get('last_arena_post_time', None)
             
             if state.get('start_url') != self.start_url:
                 self.url_queue.append(self.start_url)
@@ -528,12 +671,20 @@ class WebCrawler:
             self.visited_urls = set()
             self.known_domains = set()
             self.broken_images_count = 0
+            self.last_arena_post_time = None
 
     def handle_exit(self, signum, frame):
         print("\nSaving state before exit...")
-        self.save_state()
-        self._close_browser()
-        exit(0)
+        try:
+            self.save_state()
+            print("State saved.")
+        except Exception as e:
+            print(f"Warning: Error saving state: {e}")
+        
+        # Skip browser cleanup - os._exit will kill all processes anyway
+        # Trying to close browser might hang if it's stuck in a blocking operation
+        print("Exiting...")
+        os._exit(0)
 
     def _is_shortener_url(self, url):
         """Return True if the URL belongs to a known shortener that should be skipped."""
@@ -546,13 +697,76 @@ class WebCrawler:
             return False
         except Exception:
             return False
+    
+    def _is_amazon_url(self, url):
+        """Return True if the URL belongs to Amazon and should be skipped."""
+        try:
+            netloc = urlparse(url).netloc.lower()
+            # Remove 'www.' prefix if present for easier matching
+            if netloc.startswith('www.'):
+                netloc = netloc[4:]
+            
+            amazon_domains = ('amazon.com', 'amazon.co.uk', 'amazon.ca', 'amazon.de', 
+                            'amazon.fr', 'amazon.it', 'amazon.es', 'amazon.co.jp',
+                            'amazon.in', 'amazon.com.au', 'amazon.com.mx', 'amazon.nl',
+                            'amazon.se', 'amazon.pl', 'amazon.com.br', 'amazon.sg',
+                            'amazon.ae', 'amazon.sa', 'amazon.tr', 'amazon.eg')
+            for domain in amazon_domains:
+                if netloc == domain or netloc.endswith('.' + domain):
+                    return True
+            return False
+        except Exception:
+            return False
+    
+    def _is_google_url(self, url):
+        """Return True if the URL belongs to Google and should be skipped."""
+        try:
+            netloc = urlparse(url).netloc.lower()
+            # Remove 'www.' prefix if present for easier matching
+            if netloc.startswith('www.'):
+                netloc = netloc[4:]
+            
+            google_domains = ('google.com', 'google.co.uk', 'google.ca', 'google.de',
+                            'google.fr', 'google.it', 'google.es', 'google.co.jp',
+                            'google.com.au', 'google.com.mx', 'google.nl', 'google.se',
+                            'google.pl', 'google.com.br', 'google.sg', 'google.ae',
+                            'google.sa', 'google.tr', 'google.eg', 'google.in',
+                            'google.ru', 'google.cn', 'google.co.za', 'google.co.nz',
+                            'google.com.ar', 'google.cl', 'google.co.kr', 'google.com.tw',
+                            'google.com.hk', 'google.com.sg', 'google.co.id', 'google.com.ph',
+                            'google.com.vn', 'google.com.my', 'google.com.th', 'youtube.com',
+                            'youtu.be', 'gmail.com', 'googlemail.com', 'googletagmanager.com',
+                            'googleapis.com', 'googleusercontent.com', 'gstatic.com',
+                            'googleadservices.com', 'doubleclick.net', 'googlesyndication.com')
+            for domain in google_domains:
+                if netloc == domain or netloc.endswith('.' + domain):
+                    return True
+            return False
+        except Exception:
+            return False
+    
+    def _is_pdf_url(self, url):
+        """Return True if the URL points to a PDF file."""
+        try:
+            parsed = urlparse(url)
+            path = parsed.path.lower()
+            # Check if URL ends with .pdf or has pdf in the path
+            if path.endswith('.pdf') or '/pdf' in path:
+                return True
+            return False
+        except Exception:
+            return False
 
     def extract_links(self, soup, base_url):
         links = []
         for a_tag in soup.find_all('a', href=True):
             href = a_tag['href']
             absolute_url = urljoin(base_url, href)
-            if absolute_url.startswith(('http://', 'https://')) and not self._is_shortener_url(absolute_url):
+            if (absolute_url.startswith(('http://', 'https://')) and 
+                not self._is_shortener_url(absolute_url) and 
+                not self._is_amazon_url(absolute_url) and
+                not self._is_google_url(absolute_url) and
+                not self._is_pdf_url(absolute_url)):
                 links.append(absolute_url)
         return links
 
@@ -582,6 +796,124 @@ class WebCrawler:
             return []
         except json.JSONDecodeError:
             return []
+    
+    def load_post_queue(self):
+        """Load the queue of images waiting to be posted to are.na"""
+        try:
+            if os.path.exists(self.post_queue_file):
+                with open(self.post_queue_file, 'r') as f:
+                    queue_data = json.load(f)
+                    print(f"📋 Loaded {len(queue_data)} items from post queue")
+                    return deque(queue_data)
+            return deque()
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"⚠️  Error loading post queue: {e}, starting with empty queue")
+            return deque()
+    
+    def save_post_queue(self):
+        """Save the queue of images waiting to be posted to are.na"""
+        try:
+            with open(self.post_queue_file, 'w') as f:
+                json.dump(list(self.post_queue), f, indent=2)
+        except Exception as e:
+            print(f"⚠️  Error saving post queue: {e}")
+    
+    def add_to_post_queue(self, content, img_url, alt_text, page_url):
+        """Add an item to the post queue"""
+        # Never queue logo-related entries for posting.
+        if 'logo' in (alt_text or '').lower():
+            print(f"⏭️  Skipping Are.na post (contains 'logo'): {alt_text}")
+            return
+
+        queue_item = {
+            'content': content,
+            'img_url': img_url,
+            'alt_text': alt_text,
+            'page_url': page_url,
+            'timestamp': datetime.now().strftime("%m/%d/%Y, %H:%M")
+        }
+        self.post_queue.append(queue_item)
+        self.save_post_queue()
+        print(f"📝 Added to post queue: {alt_text} (Queue size: {len(self.post_queue)})")
+    
+    def process_post_queue(self):
+        """Process items from the post queue with rate limiting"""
+        if not self.post_queue:
+            return
+        
+        # Enforce logo-filter for any legacy items already in queue.
+        while self.post_queue:
+            queued_alt = (self.post_queue[0].get('alt_text') or '').lower()
+            if 'logo' not in queued_alt:
+                break
+            skipped_item = self.post_queue.popleft()
+            self.save_post_queue()
+            print(f"⏭️  Removed queued logo item (not posting): {skipped_item.get('alt_text', '')}")
+        
+        if not self.post_queue:
+            return
+        
+        # Check if we can post (rate limiting)
+        current_time = time.time()
+        if self.last_arena_post_time is not None:
+            time_since_last_post = current_time - self.last_arena_post_time
+            if time_since_last_post < self.arena_post_interval:
+                # Not enough time has passed, skip for now
+                return
+        
+        # Get the next item from the queue
+        queue_item = self.post_queue[0]  # Peek at first item without removing
+        
+        content = queue_item['content']
+        alt_text = queue_item['alt_text']
+        
+        max_retries = 3
+        retry_delay = 1
+        for attempt in range(max_retries):
+            try:
+                print(f"📤 Processing post queue: Attempting to post '{alt_text}' (attempt {attempt + 1}/{max_retries})")
+                print(f"   Queue size: {len(self.post_queue)}")
+                
+                self.arena_api.post_to_channel(self.channel_slug, content)
+                print(f"✅ Posted to Are.na: {alt_text}")
+                
+                # Success! Remove from queue and update state
+                self.post_queue.popleft()  # Remove the item we just posted
+                self.save_post_queue()
+                self.last_published_alt_text = alt_text
+                self.last_arena_post_time = time.time()
+                
+                # Update broken_images_data if this item matches
+                for broken_img in self.broken_images_data:
+                    if (broken_img.get('alt_text') == alt_text and 
+                        broken_img.get('img_url') == queue_item['img_url'] and
+                        broken_img.get('page_url') == queue_item['page_url']):
+                        broken_img['arena_post_success'] = True
+                        with open(self.broken_images_file, 'w') as f:
+                            json.dump(self.broken_images_data, f, indent=2)
+                        break
+                
+                break  # Success, exit retry loop
+                
+            except Exception as e:
+                # Check if this is a network connectivity error
+                if self._is_network_error(e):
+                    print(f"⚠️  Network error detected while posting to Are.na: {e}")
+                    self.network_paused = True
+                    # Don't remove from queue, we'll retry when network is back
+                    break
+                else:
+                    print(f"❌ Are.na posting failed on attempt {attempt + 1}: {e}")
+                    if attempt < max_retries - 1:
+                        print(f"   Retrying in {retry_delay} seconds...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                    else:
+                        print(f"❌ Failed to post to Are.na after {max_retries} attempts: {e}")
+                        # Remove from queue after max retries to prevent infinite retries
+                        self.post_queue.popleft()
+                        self.save_post_queue()
+                        print(f"   Removed from queue after max retries")
 
     def save_broken_image(self, img_url, alt_text, page_url):
         broken_image = {
@@ -606,12 +938,43 @@ class WebCrawler:
                 entry['page_url'] == page_url):
                 return True
         return False
+    
+    def _confirm_broken_image_url(self, img_url):
+        """Return True only when the image URL appears truly broken via direct fetch + decode."""
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': self.current_url if hasattr(self, 'current_url') else self.start_url,
+        }
+        try:
+            response = requests.get(img_url, headers=headers, timeout=12, allow_redirects=True)
+            if response.status_code >= 400:
+                return True
+            content_type = (response.headers.get('Content-Type') or '').lower()
+            if content_type and 'image' not in content_type:
+                return True
+            if not response.content:
+                return True
+            try:
+                # Verify that bytes decode as a real image; invalid/HTML placeholders fail here.
+                image = Image.open(io.BytesIO(response.content))
+                image.verify()
+                return False
+            except Exception:
+                return True
+        except (ConnectionError, Timeout, RequestException):
+            # Uncertain due transient network conditions; avoid false positives.
+            return False
+        except Exception:
+            return False
 
     def crawl_page_for_broken_images(self, url):
         page = self._browser_context.new_page()
         try:
             # Load the page in a real browser and wait for network to settle
-            page.goto(url, wait_until='networkidle', timeout=30000)
+            # Timeout set to 20 seconds - if page takes longer, skip to next
+            page.goto(url, wait_until='networkidle', timeout=20000)
             effective_url = page.url
             self.current_url = effective_url
 
@@ -619,7 +982,21 @@ class WebCrawler:
             # img.complete==true && img.naturalWidth==0 is the standard browser check.
             broken_imgs = page.evaluate("""() =>
                 Array.from(document.querySelectorAll('img'))
-                    .filter(img => img.complete && img.naturalWidth === 0 && img.src)
+                    .filter(img => {
+                        if (!(img.complete && img.naturalWidth === 0 && img.src)) return false;
+                        
+                        // Skip hidden carousel/lazy elements that are often temporarily unresolved.
+                        const hiddenAncestor = img.closest('[aria-hidden="true"], [hidden]');
+                        if (hiddenAncestor) return false;
+                        
+                        const style = window.getComputedStyle(img);
+                        if (!style || style.display === 'none' || style.visibility === 'hidden') return false;
+                        
+                        const rect = img.getBoundingClientRect();
+                        if (rect.width === 0 || rect.height === 0) return false;
+                        
+                        return true;
+                    })
                     .map(img => ({ src: img.src, alt: img.getAttribute('alt') || '' }))
             """)
 
@@ -629,11 +1006,52 @@ class WebCrawler:
             links = self.extract_links(soup, effective_url)
 
         except Exception as e:
-            print(f"Error crawling page {url}: {e}")
-            page.close()
+            error_str = str(e).lower()
+            # Check if this is a timeout (page took too long)
+            is_timeout = 'timeout' in error_str or 'timed out' in error_str
+            
+            if is_timeout:
+                print(f"⏱️  Page timeout (>20s) - skipping {url}")
+                # Mark as visited so we don't retry
+                self.visited_urls.add(url)
+                return []
+            
+            # Check if this is a network connectivity error
+            if self._is_network_error(e):
+                # Track retry count for this URL
+                retry_count = self.url_retry_count.get(url, 0) + 1
+                self.url_retry_count[url] = retry_count
+                
+                # If we've retried this URL 3 times, give up and mark as visited
+                if retry_count >= 3:
+                    print(f"⚠️  Network error on {url} (retried {retry_count} times) - giving up")
+                    self.visited_urls.add(url)
+                    # Remove from retry tracking
+                    if url in self.url_retry_count:
+                        del self.url_retry_count[url]
+                else:
+                    print(f"⚠️  Network error detected while crawling {url}: {e} (retry {retry_count}/3)")
+                    self.network_paused = True
+                    # Put the URL back at the front of the queue so we can retry it
+                    self.url_queue.appendleft(url)
+            else:
+                # Not a network error - server error, protocol error, etc.
+                # Mark as visited so we don't retry infinitely
+                print(f"⚠️  Page error (not network) - skipping {url}: {e}")
+                self.visited_urls.add(url)
+                # Clear retry count if it exists
+                if url in self.url_retry_count:
+                    del self.url_retry_count[url]
             return []
         finally:
-            page.close()
+            try:
+                page.close()
+            except Exception:
+                pass
+
+        # Successful crawl - clear retry count if it exists
+        if url in self.url_retry_count:
+            del self.url_retry_count[url]
 
         # Queue discovered links
         current_domain = '/'.join(url.split('/')[:3])
@@ -674,6 +1092,10 @@ class WebCrawler:
             # Skip duplicates
             if self.is_duplicate_broken_image(img_url, alt_text, effective_url):
                 continue
+            
+            # Confirm with a direct fetch/decode check to reduce browser-render false positives.
+            if not self._confirm_broken_image_url(img_url):
+                continue
 
             self.save_broken_image(img_url, alt_text, effective_url)
 
@@ -696,34 +1118,9 @@ class WebCrawler:
                 'description': f'page url: *{effective_url}*\nimage url: *{img_url}*',
             }
 
-            max_retries = 3
-            retry_delay = 1
-            for attempt in range(max_retries):
-                try:
-                    print(f"Attempting to post to Are.na (attempt {attempt + 1}/{max_retries})")
-                    print(f"Channel: {self.channel_slug}")
-                    print(f"Content: {content}")
-
-                    if attempt > 0:
-                        time.sleep(0.1)
-
-                    self.arena_api.post_to_channel(self.channel_slug, content)
-                    print(f"Posted to Are.na: {alt_text}")
-                    self.last_published_alt_text = alt_text
-                    if self.broken_images_data:
-                        self.broken_images_data[-1]['arena_post_success'] = True
-                        with open(self.broken_images_file, 'w') as f:
-                            json.dump(self.broken_images_data, f, indent=2)
-                    break
-                except Exception as e:
-                    print(f"Are.na posting failed on attempt {attempt + 1}: {e}")
-                    if attempt < max_retries - 1:
-                        print(f"Retrying in {retry_delay} seconds...")
-                        time.sleep(retry_delay)
-                        retry_delay *= 2
-                    else:
-                        print(f"Failed to post to Are.na after {max_retries} attempts: {e}")
-                        self.broken_images_count -= 1
+            # Add to post queue instead of posting immediately
+            # The queue will be processed with rate limiting in the main loop
+            self.add_to_post_queue(content, img_url, alt_text, effective_url)
 
         return broken_images_alt_texts
 
@@ -736,6 +1133,18 @@ class WebCrawler:
             if link not in self.visited_urls and link not in self.url_queue:
                 # Skip known URL shorteners
                 if self._is_shortener_url(link):
+                    continue
+                
+                # Skip Amazon links
+                if self._is_amazon_url(link):
+                    continue
+                
+                # Skip Google links
+                if self._is_google_url(link):
+                    continue
+                
+                # Skip PDF files
+                if self._is_pdf_url(link):
                     continue
 
                 # Validate that the link is a well-formed HTTP(S) URL before enqueueing.
@@ -755,16 +1164,32 @@ class WebCrawler:
     def get_next_url(self):
         while self.url_queue:
             url = self.url_queue.popleft()
+            # Skip Amazon links even if they're in the queue
+            if self._is_amazon_url(url):
+                self.visited_urls.add(url)  # Mark as visited so we don't try again
+                continue
+            # Skip Google links even if they're in the queue
+            if self._is_google_url(url):
+                self.visited_urls.add(url)  # Mark as visited so we don't try again
+                continue
+            # Skip PDF files even if they're in the queue
+            if self._is_pdf_url(url):
+                self.visited_urls.add(url)  # Mark as visited so we don't try again
+                continue
             if url not in self.visited_urls:
                 return url
-        
-        if self.known_domains:
-            return random.choice(list(self.known_domains))
+
+        # Queue is empty — clear visited history and restart from start_url
+        # so the crawler keeps finding new pages indefinitely.
+        print("Queue empty — clearing visited history and restarting from start URL.")
+        self.visited_urls.clear()
         return self.start_url
 
-    def continuous_crawl(self, interval=5):
+    def continuous_crawl(self):
         print("\nPress Ctrl+C to save and exit.")
         print(f"Total broken images found so far: {self.broken_images_count}")
+        if len(self.post_queue) > 0:
+            print(f"📋 Post queue: {len(self.post_queue)} items waiting to be posted")
         if self.sound_notifications:
             print("🔊 Sound notifications enabled - you'll hear a beep when broken images are found!")
         else:
@@ -772,10 +1197,48 @@ class WebCrawler:
         scrape_count = 0
         try:
             while True:
+                # Check network connectivity before processing
+                if self.network_paused or not self.check_network_connectivity():
+                    if not self.network_paused:
+                        self.network_paused = True
+                    self.wait_for_network_recovery()
+                    continue
+                
+                # Process post queue (with rate limiting) before crawling new pages
+                # This ensures queued items are posted even if we're not finding new broken images
+                self.process_post_queue()
+                
                 current_url = self.get_next_url()
+                
+                # Skip Amazon URLs (double-check in case one slipped through)
+                if self._is_amazon_url(current_url):
+                    print(f"\n⏭️  Skipping Amazon URL: {current_url}")
+                    self.visited_urls.add(current_url)
+                    continue
+                
+                # Skip Google URLs (double-check in case one slipped through)
+                if self._is_google_url(current_url):
+                    print(f"\n⏭️  Skipping Google URL: {current_url}")
+                    self.visited_urls.add(current_url)
+                    continue
+                
+                # Skip PDF files (double-check in case one slipped through)
+                if self._is_pdf_url(current_url):
+                    print(f"\n⏭️  Skipping PDF file: {current_url}")
+                    self.visited_urls.add(current_url)
+                    continue
+                
                 print(f"\nCrawling: {current_url}")
                 
                 broken_images = self.crawl_page_for_broken_images(current_url)
+                
+                # If network error occurred during crawling, wait for recovery
+                # Don't mark URL as visited since we put it back in the queue
+                if self.network_paused:
+                    self.wait_for_network_recovery()
+                    continue
+                
+                # Only mark as visited if crawl was successful (no network error)
                 self.visited_urls.add(current_url)
                 self.known_domains.add(current_url)
                 
@@ -786,20 +1249,28 @@ class WebCrawler:
                     self.url_queue = deque(queue_list)
                     scrape_count = 0
 
-                print(f"Queue: {len(self.url_queue)}, Visited: {len(self.visited_urls)}, Total found: {self.broken_images_count}")
+                print(f"Queue: {len(self.url_queue)}, Visited: {len(self.visited_urls)}, Total found: {self.broken_images_count}, Post queue: {len(self.post_queue)}")
+                
+                # Process post queue again after crawling (in case we added new items)
+                self.process_post_queue()
                 
                 if len(self.visited_urls) >= self.max_visited:
                     print("Resetting visited URLs list...")
                     self.save_state()
                     self.visited_urls.clear()
 
-                time.sleep(interval)
-
         except KeyboardInterrupt:
             print("\nReceived keyboard interrupt...")
-            self.save_state()
-            print("Exiting gracefully.")
-            exit(0)
+            try:
+                self.save_state()
+                print("State saved.")
+            except Exception as e:
+                print(f"Warning: Error saving state: {e}")
+            
+            # Skip browser cleanup - os._exit will kill all processes anyway
+            # Trying to close browser might hang if it's stuck in a blocking operation
+            print("Exiting...")
+            os._exit(0)
 
     def test_image_url(self, url):
         """Test a specific image URL to see if it's correctly identified as broken or valid"""
@@ -846,7 +1317,7 @@ if __name__ == "__main__":
     arena_api.get_authorization()
     print("Authorization successful!")
     
-    start_url = 'https://www.forumancientcoins.com/dougsmith/photo.html?srsltid=AfmBOooDh8XWrk5e34oyUy58lDdNCN18NxBprVDZXOlmSqZuAZXiV0TZ' 
+    start_url = 'https://tregeagle.com/' 
     CHANNEL_SLUG = "broken-images-and-the-alt-text-that-remains"
     
     print(f"Testing channel access for '{CHANNEL_SLUG}'...")
