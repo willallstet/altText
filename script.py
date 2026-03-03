@@ -17,8 +17,6 @@ from dotenv import load_dotenv
 from datetime import datetime
 import signal
 import atexit
-from PIL import Image
-import io
 import sys
 from playwright.sync_api import sync_playwright
 from requests.exceptions import ConnectionError, Timeout, RequestException
@@ -939,36 +937,6 @@ class WebCrawler:
                 return True
         return False
     
-    def _confirm_broken_image_url(self, img_url):
-        """Return True only when the image URL appears truly broken via direct fetch + decode."""
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': self.current_url if hasattr(self, 'current_url') else self.start_url,
-        }
-        try:
-            response = requests.get(img_url, headers=headers, timeout=12, allow_redirects=True)
-            if response.status_code >= 400:
-                return True
-            content_type = (response.headers.get('Content-Type') or '').lower()
-            if content_type and 'image' not in content_type:
-                return True
-            if not response.content:
-                return True
-            try:
-                # Verify that bytes decode as a real image; invalid/HTML placeholders fail here.
-                image = Image.open(io.BytesIO(response.content))
-                image.verify()
-                return False
-            except Exception:
-                return True
-        except (ConnectionError, Timeout, RequestException):
-            # Uncertain due transient network conditions; avoid false positives.
-            return False
-        except Exception:
-            return False
-
     def crawl_page_for_broken_images(self, url):
         page = self._browser_context.new_page()
         try:
@@ -978,27 +946,78 @@ class WebCrawler:
             effective_url = page.url
             self.current_url = effective_url
 
-            # Ask the browser which images show the broken-image icon.
-            # img.complete==true && img.naturalWidth==0 is the standard browser check.
-            broken_imgs = page.evaluate("""() =>
-                Array.from(document.querySelectorAll('img'))
-                    .filter(img => {
-                        if (!(img.complete && img.naturalWidth === 0 && img.src)) return false;
-                        
-                        // Skip hidden carousel/lazy elements that are often temporarily unresolved.
-                        const hiddenAncestor = img.closest('[aria-hidden="true"], [hidden]');
-                        if (hiddenAncestor) return false;
-                        
-                        const style = window.getComputedStyle(img);
-                        if (!style || style.display === 'none' || style.visibility === 'hidden') return false;
-                        
-                        const rect = img.getBoundingClientRect();
-                        if (rect.width === 0 || rect.height === 0) return false;
-                        
-                        return true;
-                    })
-                    .map(img => ({ src: img.src, alt: img.getAttribute('alt') || '' }))
-            """)
+            # Ask the browser to confirm only user-visible broken images.
+            # This avoids backend-fetch false positives and mirrors what a person sees.
+            broken_imgs = page.evaluate("""async () => {
+                const isVisible = (img) => {
+                    if (!img || !img.isConnected) return false;
+                    const hiddenAncestor = img.closest('[aria-hidden="true"], [hidden], template');
+                    if (hiddenAncestor) return false;
+                    const style = window.getComputedStyle(img);
+                    if (!style) return false;
+                    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+                    const rect = img.getBoundingClientRect();
+                    if (rect.width < 8 || rect.height < 8) return false;
+                    const inViewport = rect.bottom > 0 && rect.right > 0 &&
+                        rect.top < (window.innerHeight || document.documentElement.clientHeight) &&
+                        rect.left < (window.innerWidth || document.documentElement.clientWidth);
+                    return inViewport;
+                };
+
+                const probeInBrowser = async (src, timeoutMs = 7000) => {
+                    return await new Promise((resolve) => {
+                        const probe = new Image();
+                        let settled = false;
+                        const done = (broken) => {
+                            if (!settled) {
+                                settled = true;
+                                resolve(broken);
+                            }
+                        };
+                        const timer = setTimeout(() => done(false), timeoutMs);
+                        probe.onload = () => {
+                            clearTimeout(timer);
+                            done(false);
+                        };
+                        probe.onerror = () => {
+                            clearTimeout(timer);
+                            done(true);
+                        };
+                        probe.src = src;
+                    });
+                };
+
+                const imgs = Array.from(document.images || []);
+                const confirmed = [];
+
+                for (const img of imgs) {
+                    const src = img.currentSrc || img.src;
+                    if (!src || !isVisible(img)) continue;
+
+                    // Give lazy/on-demand images a chance to decode before judging.
+                    if (!img.complete) {
+                        try {
+                            await img.decode();
+                        } catch (e) {
+                            // decode() can fail for many reasons; final decision is below.
+                        }
+                    }
+
+                    const appearsBrokenNow = img.complete && img.naturalWidth === 0;
+                    if (!appearsBrokenNow) continue;
+
+                    // Confirm from the same browser context; only then treat as truly broken.
+                    const confirmedBroken = await probeInBrowser(src);
+                    if (!confirmedBroken) continue;
+
+                    confirmed.push({
+                        src,
+                        alt: img.getAttribute('alt') || ''
+                    });
+                }
+
+                return confirmed;
+            }""")
 
             # Extract links for the crawl queue from the live page HTML
             html = page.content()
@@ -1093,10 +1112,6 @@ class WebCrawler:
             if self.is_duplicate_broken_image(img_url, alt_text, effective_url):
                 continue
             
-            # Confirm with a direct fetch/decode check to reduce browser-render false positives.
-            if not self._confirm_broken_image_url(img_url):
-                continue
-
             self.save_broken_image(img_url, alt_text, effective_url)
 
             if alt_text == self.last_published_alt_text:
