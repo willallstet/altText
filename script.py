@@ -475,7 +475,7 @@ class WebCrawler:
         # Ensure it's initialized (load_state may have set it, or it's None for new crawls)
         if not hasattr(self, 'last_arena_post_time'):
             self.last_arena_post_time = None
-        self.arena_post_interval = 600  # 10 minutes in seconds
+        self.arena_post_interval = 12 * 60 * 60  # 12 hours in seconds
 
         # Queue for images waiting to be posted to are.na (persists between sessions)
         self.post_queue_file = 'post_queue.json'
@@ -834,11 +834,14 @@ class WebCrawler:
         self.save_post_queue()
         print(f"📝 Added to post queue: {alt_text} (Queue size: {len(self.post_queue)})")
     
+    BATCH_UPLOAD_SIZE = 10
+    BATCH_POST_DELAY = 2  # seconds between posts within a batch
+
     def process_post_queue(self):
-        """Process items from the post queue with rate limiting"""
+        """Process items from the post queue: only when queue has 10+, upload up to 10 at a time."""
         if not self.post_queue:
             return
-        
+
         # Enforce logo-filter for any legacy items already in queue.
         while self.post_queue:
             queued_alt = (self.post_queue[0].get('alt_text') or '').lower()
@@ -847,71 +850,74 @@ class WebCrawler:
             skipped_item = self.post_queue.popleft()
             self.save_post_queue()
             print(f"⏭️  Removed queued logo item (not posting): {skipped_item.get('alt_text', '')}")
-        
+
         if not self.post_queue:
             return
-        
-        # Check if we can post (rate limiting)
+
+        # Only process when queue has reached batch size
+        if len(self.post_queue) < self.BATCH_UPLOAD_SIZE:
+            return
+
+        # Check if we can post (rate limiting between batches)
         current_time = time.time()
         if self.last_arena_post_time is not None:
             time_since_last_post = current_time - self.last_arena_post_time
             if time_since_last_post < self.arena_post_interval:
-                # Not enough time has passed, skip for now
                 return
-        
-        # Get the next item from the queue
-        queue_item = self.post_queue[0]  # Peek at first item without removing
-        
-        content = queue_item['content']
-        alt_text = queue_item['alt_text']
-        
-        max_retries = 3
-        retry_delay = 1
-        for attempt in range(max_retries):
-            try:
-                print(f"📤 Processing post queue: Attempting to post '{alt_text}' (attempt {attempt + 1}/{max_retries})")
-                print(f"   Queue size: {len(self.post_queue)}")
-                
-                self.arena_api.post_to_channel(self.channel_slug, content)
-                print(f"✅ Posted to Are.na: {alt_text}")
-                
-                # Success! Remove from queue and update state
-                self.post_queue.popleft()  # Remove the item we just posted
-                self.save_post_queue()
-                self.last_published_alt_text = alt_text
-                self.last_arena_post_time = time.time()
-                
-                # Update broken_images_data if this item matches
-                for broken_img in self.broken_images_data:
-                    if (broken_img.get('alt_text') == alt_text and 
-                        broken_img.get('img_url') == queue_item['img_url'] and
-                        broken_img.get('page_url') == queue_item['page_url']):
-                        broken_img['arena_post_success'] = True
-                        with open(self.broken_images_file, 'w') as f:
-                            json.dump(self.broken_images_data, f, indent=2)
-                        break
-                
-                break  # Success, exit retry loop
-                
-            except Exception as e:
-                # Check if this is a network connectivity error
-                if self._is_network_error(e):
-                    print(f"⚠️  Network error detected while posting to Are.na: {e}")
-                    self.network_paused = True
-                    # Don't remove from queue, we'll retry when network is back
+
+        # Process up to BATCH_UPLOAD_SIZE items
+        to_process = min(len(self.post_queue), self.BATCH_UPLOAD_SIZE)
+        print(f"📤 Post queue at {len(self.post_queue)} — uploading batch of {to_process}")
+
+        for _ in range(to_process):
+            if not self.post_queue:
+                break
+
+            queue_item = self.post_queue[0]
+            content = queue_item['content']
+            alt_text = queue_item['alt_text']
+
+            max_retries = 3
+            retry_delay = 1
+            for attempt in range(max_retries):
+                try:
+                    print(f"   Posting '{alt_text}' (attempt {attempt + 1}/{max_retries})")
+                    self.arena_api.post_to_channel(self.channel_slug, content)
+                    print(f"   ✅ Posted to Are.na: {alt_text}")
+
+                    self.post_queue.popleft()
+                    self.save_post_queue()
+                    self.last_published_alt_text = alt_text
+                    self.last_arena_post_time = time.time()
+
+                    for broken_img in self.broken_images_data:
+                        if (broken_img.get('alt_text') == alt_text and
+                            broken_img.get('img_url') == queue_item['img_url'] and
+                            broken_img.get('page_url') == queue_item['page_url']):
+                            broken_img['arena_post_success'] = True
+                            with open(self.broken_images_file, 'w') as f:
+                                json.dump(self.broken_images_data, f, indent=2)
+                            break
+
                     break
-                else:
-                    print(f"❌ Are.na posting failed on attempt {attempt + 1}: {e}")
+                except Exception as e:
+                    if self._is_network_error(e):
+                        print(f"⚠️  Network error while posting to Are.na: {e}")
+                        self.network_paused = True
+                        return
+                    print(f"   ❌ Post failed on attempt {attempt + 1}: {e}")
                     if attempt < max_retries - 1:
-                        print(f"   Retrying in {retry_delay} seconds...")
                         time.sleep(retry_delay)
                         retry_delay *= 2
                     else:
-                        print(f"❌ Failed to post to Are.na after {max_retries} attempts: {e}")
-                        # Remove from queue after max retries to prevent infinite retries
                         self.post_queue.popleft()
                         self.save_post_queue()
                         print(f"   Removed from queue after max retries")
+                        break
+
+            # Short delay between posts in the same batch
+            if self.post_queue and _ < to_process - 1:
+                time.sleep(self.BATCH_POST_DELAY)
 
     def save_broken_image(self, img_url, alt_text, page_url):
         broken_image = {
@@ -1178,7 +1184,10 @@ class WebCrawler:
 
     def get_next_url(self):
         while self.url_queue:
-            url = self.url_queue.popleft()
+            # Pick a random URL from the queue each time instead of FIFO order.
+            random_index = random.randrange(len(self.url_queue))
+            url = self.url_queue[random_index]
+            del self.url_queue[random_index]
             # Skip Amazon links even if they're in the queue
             if self._is_amazon_url(url):
                 self.visited_urls.add(url)  # Mark as visited so we don't try again
@@ -1332,7 +1341,7 @@ if __name__ == "__main__":
     arena_api.get_authorization()
     print("Authorization successful!")
     
-    start_url = 'https://tregeagle.com/' 
+    start_url = 'https://philip.greenspun.com/travel/' 
     CHANNEL_SLUG = "broken-images-and-the-alt-text-that-remains"
     
     print(f"Testing channel access for '{CHANNEL_SLUG}'...")
