@@ -755,6 +755,45 @@ class WebCrawler:
         except Exception:
             return False
 
+    def _is_instagram_url(self, url):
+        """Return True if the URL belongs to Instagram and should be skipped."""
+        try:
+            netloc = urlparse(url).netloc.lower()
+            if netloc.startswith('www.'):
+                netloc = netloc[4:]
+            return netloc == 'instagram.com' or netloc.endswith('.instagram.com')
+        except Exception:
+            return False
+
+    def _is_facebook_url(self, url):
+        """Return True if the URL belongs to Facebook and should be skipped."""
+        try:
+            netloc = urlparse(url).netloc.lower()
+            if netloc.startswith('www.'):
+                netloc = netloc[4:]
+            facebook_domains = ('facebook.com', 'fb.com', 'fb.me', 'fb.watch', 'm.facebook.com')
+            return any(netloc == d or netloc.endswith('.' + d) for d in facebook_domains)
+        except Exception:
+            return False
+
+    def _is_twitter_url(self, url):
+        """Return True if the URL belongs to Twitter/X and should be skipped."""
+        try:
+            netloc = urlparse(url).netloc.lower()
+            if netloc.startswith('www.'):
+                netloc = netloc[4:]
+            return netloc in ('twitter.com', 'x.com') or netloc.endswith('.twitter.com') or netloc.endswith('.x.com')
+        except Exception:
+            return False
+
+    def _is_wayback_url(self, url):
+        """Return True if the URL is from the Wayback Machine (web.archive.org) and should be skipped."""
+        try:
+            netloc = urlparse(url).netloc.lower()
+            return netloc == 'web.archive.org' or netloc.endswith('.web.archive.org')
+        except Exception:
+            return False
+
     def extract_links(self, soup, base_url):
         links = []
         for a_tag in soup.find_all('a', href=True):
@@ -764,7 +803,11 @@ class WebCrawler:
                 not self._is_shortener_url(absolute_url) and 
                 not self._is_amazon_url(absolute_url) and
                 not self._is_google_url(absolute_url) and
-                not self._is_pdf_url(absolute_url)):
+                not self._is_pdf_url(absolute_url) and
+                not self._is_instagram_url(absolute_url) and
+                not self._is_facebook_url(absolute_url) and
+                not self._is_twitter_url(absolute_url) and
+                not self._is_wayback_url(absolute_url)):
                 links.append(absolute_url)
         return links
 
@@ -816,11 +859,21 @@ class WebCrawler:
         except Exception as e:
             print(f"⚠️  Error saving post queue: {e}")
     
+    EXCLUDED_CAPTIONS = frozenset(('google search', 'powered by toolforge'))
+
     def add_to_post_queue(self, content, img_url, alt_text, page_url):
         """Add an item to the post queue"""
         # Never queue logo-related entries for posting.
         if 'logo' in (alt_text or '').lower():
             print(f"⏭️  Skipping Are.na post (contains 'logo'): {alt_text}")
+            return
+        # Never queue excluded captions (e.g. Google Search, Powered by Toolforge).
+        if (alt_text or '').strip().lower() in self.EXCLUDED_CAPTIONS:
+            print(f"⏭️  Skipping Are.na post (excluded caption): {alt_text}")
+            return
+        # Never queue captions that include "Transitional".
+        if 'transitional' in (alt_text or '').lower():
+            print(f"⏭️  Skipping Are.na post (contains 'Transitional'): {alt_text}")
             return
 
         queue_item = {
@@ -842,14 +895,16 @@ class WebCrawler:
         if not self.post_queue:
             return
 
-        # Enforce logo-filter for any legacy items already in queue.
+        # Enforce logo- and caption-filter for any legacy items already in queue.
         while self.post_queue:
             queued_alt = (self.post_queue[0].get('alt_text') or '').lower()
-            if 'logo' not in queued_alt:
+            queued_alt_stripped = (self.post_queue[0].get('alt_text') or '').strip().lower()
+            if ('logo' not in queued_alt and queued_alt_stripped not in self.EXCLUDED_CAPTIONS
+                    and 'transitional' not in queued_alt):
                 break
             skipped_item = self.post_queue.popleft()
             self.save_post_queue()
-            print(f"⏭️  Removed queued logo item (not posting): {skipped_item.get('alt_text', '')}")
+            print(f"⏭️  Removed queued item (not posting): {skipped_item.get('alt_text', '')}")
 
         if not self.post_queue:
             return
@@ -1168,6 +1223,11 @@ class WebCrawler:
                 if self._is_pdf_url(link):
                     continue
 
+                # Skip Instagram, Facebook, Twitter (X), Wayback Machine
+                if (self._is_instagram_url(link) or self._is_facebook_url(link) or self._is_twitter_url(link)
+                        or self._is_wayback_url(link)):
+                    continue
+
                 # Validate that the link is a well-formed HTTP(S) URL before enqueueing.
                 # We avoid doing a network request here; any connection issues will be
                 # handled when we actually crawl the page.
@@ -1199,6 +1259,11 @@ class WebCrawler:
             # Skip PDF files even if they're in the queue
             if self._is_pdf_url(url):
                 self.visited_urls.add(url)  # Mark as visited so we don't try again
+                continue
+            # Skip Instagram, Facebook, Twitter (X), Wayback even if they're in the queue
+            if (self._is_instagram_url(url) or self._is_facebook_url(url) or self._is_twitter_url(url)
+                    or self._is_wayback_url(url)):
+                self.visited_urls.add(url)
                 continue
             if url not in self.visited_urls:
                 return url
@@ -1251,7 +1316,14 @@ class WebCrawler:
                     print(f"\n⏭️  Skipping PDF file: {current_url}")
                     self.visited_urls.add(current_url)
                     continue
-                
+
+                # Skip Instagram, Facebook, Twitter (X), Wayback (double-check in case one slipped through)
+                if (self._is_instagram_url(current_url) or self._is_facebook_url(current_url)
+                        or self._is_twitter_url(current_url) or self._is_wayback_url(current_url)):
+                    print(f"\n⏭️  Skipping link: {current_url}")
+                    self.visited_urls.add(current_url)
+                    continue
+
                 print(f"\nCrawling: {current_url}")
                 
                 broken_images = self.crawl_page_for_broken_images(current_url)
