@@ -3,3 +3,5 @@
 *.key
 __pycache__/
 *.pyc 
+
+crawler_state.json

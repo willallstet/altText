@@ -18,6 +18,7 @@ from datetime import datetime
 import signal
 import atexit
 import sys
+import argparse
 from playwright.sync_api import sync_playwright
 from requests.exceptions import ConnectionError, Timeout, RequestException
 
@@ -446,7 +447,7 @@ class ArenaAPI:
             raise Exception(error_msg)
 
 class WebCrawler:
-    def __init__(self, start_url, arena_api, channel_slug, max_visited=10000, sound_notifications=True):
+    def __init__(self, start_url, arena_api, channel_slug, max_visited=10000, sound_notifications=True, reset_state=False):
         self.start_url = start_url
         self.max_visited = max_visited
         self.arena_api = arena_api
@@ -454,7 +455,8 @@ class WebCrawler:
         self.sound_notifications = sound_notifications
         
         self.state_file = 'crawler_state.json'
-        if os.path.exists(self.state_file):
+        self._is_shutting_down = False
+        if os.path.exists(self.state_file) and not reset_state:
             self.load_state()
         else:
             self.url_queue = deque([start_url])
@@ -480,6 +482,9 @@ class WebCrawler:
         # Queue for images waiting to be posted to are.na (persists between sessions)
         self.post_queue_file = 'post_queue.json'
         self.post_queue = self.load_post_queue()
+        self.excluded_captions_file = 'excluded_captions.json'
+        self.excluded_captions = self.load_excluded_captions()
+        self._seed_exclusions_from_queue()
 
         self.broken_images_file = 'broken_images.json'
         self.broken_images_data = self.load_broken_images()
@@ -496,6 +501,12 @@ class WebCrawler:
         self.network_paused = False
         # Track retry attempts for URLs to prevent infinite loops
         self.url_retry_count = {}
+        # Crawl queue behavior:
+        # - keep normal queue growth under a soft limit
+        # - allow queue growth beyond the limit only for pages with broken images
+        self.queue_soft_limit = 100
+        self.normal_links_per_page = 10
+        self.broken_page_links_per_page = 25
 
     def _close_browser(self):
         try:
@@ -672,17 +683,25 @@ class WebCrawler:
             self.last_arena_post_time = None
 
     def handle_exit(self, signum, frame):
+        if self._is_shutting_down:
+            return
+        self._is_shutting_down = True
+
         print("\nSaving state before exit...")
         try:
             self.save_state()
             print("State saved.")
         except Exception as e:
             print(f"Warning: Error saving state: {e}")
-        
-        # Skip browser cleanup - os._exit will kill all processes anyway
-        # Trying to close browser might hang if it's stuck in a blocking operation
+
+        # Gracefully close Playwright resources to avoid EPIPE from the driver.
+        try:
+            self._close_browser()
+        except Exception as e:
+            print(f"Warning: Error closing browser: {e}")
+
         print("Exiting...")
-        os._exit(0)
+        raise SystemExit(0)
 
     def _is_shortener_url(self, url):
         """Return True if the URL belongs to a known shortener that should be skipped."""
@@ -859,21 +878,69 @@ class WebCrawler:
         except Exception as e:
             print(f"⚠️  Error saving post queue: {e}")
     
-    EXCLUDED_CAPTIONS = frozenset(('google search', 'powered by toolforge'))
+    DEFAULT_EXCLUDED_CAPTIONS = frozenset(('google search', 'powered by toolforge', 'fork me on github'))
+
+    def load_excluded_captions(self):
+        """Load excluded captions from disk and include default exclusions."""
+        excluded = set(self.DEFAULT_EXCLUDED_CAPTIONS)
+        try:
+            if os.path.exists(self.excluded_captions_file):
+                with open(self.excluded_captions_file, 'r') as f:
+                    stored = json.load(f)
+                    if isinstance(stored, list):
+                        for caption in stored:
+                            normalized = self._normalize_caption(caption)
+                            if normalized:
+                                excluded.add(normalized)
+            return excluded
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"⚠️  Error loading excluded captions: {e}, using defaults")
+            return excluded
+
+    def save_excluded_captions(self):
+        """Persist excluded captions to disk."""
+        try:
+            with open(self.excluded_captions_file, 'w') as f:
+                json.dump(sorted(self.excluded_captions), f, indent=2)
+        except OSError as e:
+            print(f"⚠️  Error saving excluded captions: {e}")
+
+    def _normalize_caption(self, caption):
+        return (caption or '').strip().lower()
+
+    def _mark_caption_as_excluded(self, alt_text):
+        normalized = self._normalize_caption(alt_text)
+        if not normalized:
+            return
+        if normalized not in self.excluded_captions:
+            self.excluded_captions.add(normalized)
+            self.save_excluded_captions()
+
+    def _seed_exclusions_from_queue(self):
+        """Ensure existing queued items are excluded from future queue additions."""
+        changed = False
+        for queue_item in self.post_queue:
+            normalized = self._normalize_caption(queue_item.get('alt_text'))
+            if normalized and normalized not in self.excluded_captions:
+                self.excluded_captions.add(normalized)
+                changed = True
+        if changed:
+            self.save_excluded_captions()
 
     def add_to_post_queue(self, content, img_url, alt_text, page_url):
         """Add an item to the post queue"""
+        normalized_alt_text = self._normalize_caption(alt_text)
         # Never queue logo-related entries for posting.
-        if 'logo' in (alt_text or '').lower():
+        if 'logo' in normalized_alt_text:
             print(f"⏭️  Skipping Are.na post (contains 'logo'): {alt_text}")
             return
         # Never queue excluded captions (e.g. Google Search, Powered by Toolforge).
-        if (alt_text or '').strip().lower() in self.EXCLUDED_CAPTIONS:
+        if normalized_alt_text in self.excluded_captions:
             print(f"⏭️  Skipping Are.na post (excluded caption): {alt_text}")
             return
-        # Never queue captions that include "Transitional".
-        if 'transitional' in (alt_text or '').lower():
-            print(f"⏭️  Skipping Are.na post (contains 'Transitional'): {alt_text}")
+        # Never queue captions that include the known validator badge text.
+        if 'valid html 4.01 transitional' in normalized_alt_text:
+            print(f"⏭️  Skipping Are.na post (contains 'Valid HTML 4.01 Transitional'): {alt_text}")
             return
 
         queue_item = {
@@ -885,6 +952,7 @@ class WebCrawler:
         }
         self.post_queue.append(queue_item)
         self.save_post_queue()
+        self._mark_caption_as_excluded(alt_text)
         print(f"📝 Added to post queue: {alt_text} (Queue size: {len(self.post_queue)})")
     
     BATCH_UPLOAD_SIZE = 10
@@ -895,12 +963,12 @@ class WebCrawler:
         if not self.post_queue:
             return
 
-        # Enforce logo- and caption-filter for any legacy items already in queue.
+        # Enforce only hard content filters for any legacy items already in queue.
+        # Do not drop items just because their caption is in excluded_captions;
+        # exclusions are for preventing future re-queue, not deleting queued posts.
         while self.post_queue:
-            queued_alt = (self.post_queue[0].get('alt_text') or '').lower()
-            queued_alt_stripped = (self.post_queue[0].get('alt_text') or '').strip().lower()
-            if ('logo' not in queued_alt and queued_alt_stripped not in self.EXCLUDED_CAPTIONS
-                    and 'transitional' not in queued_alt):
+            queued_alt = self._normalize_caption(self.post_queue[0].get('alt_text'))
+            if 'logo' not in queued_alt and 'valid html 4.01 transitional' not in queued_alt:
                 break
             skipped_item = self.post_queue.popleft()
             self.save_post_queue()
@@ -1133,16 +1201,6 @@ class WebCrawler:
         if url in self.url_retry_count:
             del self.url_retry_count[url]
 
-        # Queue discovered links
-        current_domain = '/'.join(url.split('/')[:3])
-        external_links = [l for l in links if '/'.join(l.split('/')[:3]) != current_domain]
-        internal_links = [l for l in links if '/'.join(l.split('/')[:3]) == current_domain]
-        random.shuffle(external_links)
-        random.shuffle(internal_links)
-        links_added = 0
-        links_added += self._add_links_to_queue(external_links, "external", links_added, 6)
-        links_added += self._add_links_to_queue(internal_links, "internal", links_added, 10 - links_added)
-
         skip_patterns = ['1px.gif', 'blank.gif', 'spacer.gif', 'pixel.gif', 'clear.gif',
                          'transparent.gif', 'empty.gif', 'invisible.gif', '1x1.gif',
                          'dot.gif', 'space.gif', 'tracker.gif', '0x0.gif']
@@ -1197,6 +1255,25 @@ class WebCrawler:
             # Add to post queue instead of posting immediately
             # The queue will be processed with rate limiting in the main loop
             self.add_to_post_queue(content, img_url, alt_text, effective_url)
+
+        # Queue discovered links using queue soft-limit behavior:
+        # - If queue is at/above limit, only add links when this page has broken images.
+        # - Pages with broken images add a larger batch of links.
+        has_broken_page = len(broken_imgs) > 0
+        if len(self.url_queue) >= self.queue_soft_limit and not has_broken_page:
+            print(f"⏭️  Queue at {len(self.url_queue)} (>= {self.queue_soft_limit}); skipping link adds for non-broken page")
+        else:
+            max_links = self.broken_page_links_per_page if has_broken_page else self.normal_links_per_page
+            current_domain = '/'.join(url.split('/')[:3])
+            external_links = [l for l in links if '/'.join(l.split('/')[:3]) != current_domain]
+            internal_links = [l for l in links if '/'.join(l.split('/')[:3]) == current_domain]
+            random.shuffle(external_links)
+            random.shuffle(internal_links)
+
+            links_added = 0
+            external_budget = min(12 if has_broken_page else 6, max_links)
+            links_added += self._add_links_to_queue(external_links, "external", links_added, external_budget)
+            links_added += self._add_links_to_queue(internal_links, "internal", links_added, max_links - links_added)
 
         return broken_images_alt_texts
 
@@ -1357,16 +1434,7 @@ class WebCrawler:
 
         except KeyboardInterrupt:
             print("\nReceived keyboard interrupt...")
-            try:
-                self.save_state()
-                print("State saved.")
-            except Exception as e:
-                print(f"Warning: Error saving state: {e}")
-            
-            # Skip browser cleanup - os._exit will kill all processes anyway
-            # Trying to close browser might hang if it's stuck in a blocking operation
-            print("Exiting...")
-            os._exit(0)
+            self.handle_exit(None, None)
 
     def test_image_url(self, url):
         """Test a specific image URL to see if it's correctly identified as broken or valid"""
@@ -1407,13 +1475,24 @@ class WebCrawler:
             print("🔔 BROKEN IMAGE FOUND! 🔔")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Crawl web pages, detect broken images, and queue alt text posts."
+    )
+    parser.add_argument(
+        "--restart-from",
+        dest="restart_from",
+        help="Clear saved crawl queue/state and restart crawling from this URL.",
+    )
+    args = parser.parse_args()
+
     arena_api = ArenaAPI()
     
     print("Checking authorization...")
     arena_api.get_authorization()
     print("Authorization successful!")
     
-    start_url = 'https://philip.greenspun.com/travel/' 
+    default_start_url = 'https://philip.greenspun.com/travel/'
+    start_url = args.restart_from or default_start_url
     CHANNEL_SLUG = "broken-images-and-the-alt-text-that-remains"
     
     print(f"Testing channel access for '{CHANNEL_SLUG}'...")
@@ -1436,7 +1515,17 @@ if __name__ == "__main__":
     
     # Create crawler with sound notifications enabled
     # To disable sound notifications, change sound_notifications=False
-    crawler = WebCrawler(start_url, arena_api, CHANNEL_SLUG, sound_notifications=True)
+    crawler = WebCrawler(
+        start_url,
+        arena_api,
+        CHANNEL_SLUG,
+        sound_notifications=True,
+        reset_state=bool(args.restart_from),
+    )
+
+    if args.restart_from:
+        print(f"🔄 Restart requested. Cleared saved crawl queue and restarting from: {start_url}")
+        crawler.save_state()
     
     # Test the specific URLs that were incorrectly identified as broken
     print("\n" + "="*50)
